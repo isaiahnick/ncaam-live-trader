@@ -1036,9 +1036,9 @@ class PaperTrader:
     # Option value formula (fit to backward induction with DT=120, σ=4.25¢, slip=0)
     # OV = OV_SCALE * N^OV_EXPONENT * (1 + OV_PROB_COEFF * p * (1-p))
     # where N = time_remaining / OV_DECORR_SEC (independent sell opportunities)
-    OV_SCALE = 1.71
-    OV_EXPONENT = 0.43
-    OV_PROB_COEFF = -0.76
+    OV_SCALE = 0.39
+    OV_EXPONENT = 0.42
+    OV_PROB_COEFF = 12.12
     OV_DECORR_SEC = 120  # Noise decorrelation timescale (empirical autocorrelation)
     
     # Stop loss and cooldown
