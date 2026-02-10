@@ -1038,7 +1038,7 @@ class PaperTrader:
     # where N = time_remaining / OV_DECORR_SEC (independent sell opportunities)
     OV_SCALE = 0.39
     OV_EXPONENT = 0.42
-    OV_PROB_COEFF = 12.12
+    OV_PROB_COEFF = 16.12
     OV_DECORR_SEC = 120  # Noise decorrelation timescale (empirical autocorrelation)
     
     # Stop loss and cooldown
@@ -1102,6 +1102,7 @@ class PaperTrader:
         self.live_mode = live_mode
         self.live_contracts = live_contracts
         self.kalshi_client = None
+        self._cached_kalshi_positions = None
         self.kalshi_starting_balance = 0.0  # Portfolio value at session start
         self.kalshi_starting_cash = 0.0     # Cash at session start
         
@@ -1116,7 +1117,7 @@ class PaperTrader:
             try:
                 self.kalshi_client = KalshiLiveClient(
                     api_key_id=os.environ['KALSHI_API_KEY_ID'],
-                    private_key_path=os.environ.get('KALSHI_PRIVATE_KEY_PATH', 'kalshi-key.key'),
+                    private_key_path='/root/kalshi-key.key',
                     use_demo=False,
                     max_position_size=100,
                     max_order_value_cents=5000
@@ -1149,7 +1150,7 @@ class PaperTrader:
             try:
                 self.ws_book = KalshiWSOrderbook(
                     api_key=os.environ['KALSHI_API_KEY_ID'],
-                    private_key_path=os.environ.get('KALSHI_PRIVATE_KEY_PATH', 'kalshi-key.key'),
+                    private_key_path='/root/kalshi-key.key',
                     verbose=False
                 )
                 self.ws_book.start()
@@ -1298,6 +1299,9 @@ class PaperTrader:
         loaded = 0
         skipped = 0
         
+        # Track loaded positions by event stem to detect duplicates
+        stem_to_game_id = {}  # event_stem -> game_id key used in open_positions
+        
         for ticker, pos in positions.items():
             if pos.yes_count == 0:
                 continue  # No position
@@ -1342,6 +1346,22 @@ class PaperTrader:
             home_team = odds.get('kalshi_home', 'Unknown')
             away_team = odds.get('kalshi_away', 'Unknown')
             
+            # Check for duplicate position on same event (e.g., home_no + away_yes)
+            event_stem = self._ticker_event_stem(ticker)
+            if event_stem and event_stem in stem_to_game_id:
+                existing_key = stem_to_game_id[event_stem]
+                existing_pos = self.open_positions.get(existing_key)
+                if existing_pos:
+                    existing_ct = existing_pos.get('contract_type', '')
+                    print(f"  ⚠️ DUPLICATE POSITION on same event!")
+                    print(f"     Existing: {existing_ct} x{existing_pos.get('live_fill_count')} @ {existing_pos['entry_price']*100:.0f}¢")
+                    print(f"     New:      {contract_type} x{contract_count} @ {entry_price_cents:.0f}¢")
+                    print(f"     Both bet {side.upper()} — keeping first, tracking second as sibling")
+                    # Don't create a second position — the first one already covers this game
+                    # The duplicate will still be on Kalshi but won't trigger new entries
+                    loaded += 1
+                    continue
+            
             # Try to find game_id by matching to predictions
             # We'll use ticker as temporary key if no match found
             game_id = self._find_game_id_for_teams(home_team, away_team)
@@ -1349,6 +1369,10 @@ class PaperTrader:
                 # Use ticker as fallback key - will match later when ESPN data comes in
                 game_id = f"kalshi:{ticker}"
                 print(f"  ⚠️ No game_id found for {away_team} @ {home_team}, using ticker key")
+            
+            # Track by event stem for duplicate detection
+            if event_stem:
+                stem_to_game_id[event_stem] = game_id
             
             # Build position dict with all Kalshi data
             self.open_positions[game_id] = {
@@ -1427,11 +1451,25 @@ class PaperTrader:
         
         return None
     
+    @staticmethod
+    def _ticker_event_stem(ticker: str) -> Optional[str]:
+        """Extract the event stem from a Kalshi ticker.
+        
+        Tickers look like: KXNCAAMBGAME-26FEB09-CENTRALARK-NALABAMA-NALABAMA
+        The event stem is everything up to the last dash: KXNCAAMBGAME-26FEB09-CENTRALARK-NALABAMA
+        Both teams' tickers for the same game share this stem.
+        """
+        if not ticker:
+            return None
+        parts = ticker.rsplit('-', 1)
+        return parts[0] if len(parts) == 2 else None
+    
     def _find_position_for_game(self, game_id: str, odds: Optional[dict]) -> Optional[str]:
         """Find position key for a game, handling both game_id and kalshi: prefix keys.
         
         In live mode, positions might be keyed by 'kalshi:TICKER' if game_id wasn't found
-        at startup. This method also checks for ticker matches and migrates keys if found.
+        at startup. This method also checks for ticker matches AND event stem matches,
+        and migrates keys if found.
         
         Returns the key in open_positions, or None if no position exists.
         """
@@ -1439,21 +1477,45 @@ class PaperTrader:
         if game_id in self.open_positions:
             return game_id
         
-        # Check for kalshi: prefixed positions that match this game's tickers
+        # Build set of event stems for this game's tickers
+        game_stems = set()
         if odds:
             home_ticker = odds.get('home_ticker')
             away_ticker = odds.get('away_ticker')
+            if home_ticker:
+                stem = self._ticker_event_stem(home_ticker)
+                if stem:
+                    game_stems.add(stem)
+            if away_ticker:
+                stem = self._ticker_event_stem(away_ticker)
+                if stem:
+                    game_stems.add(stem)
+        
+        # Check all positions for ticker or event stem match
+        for pos_key in list(self.open_positions.keys()):
+            pos = self.open_positions[pos_key]
+            pos_ticker = pos.get('market_ticker')
             
-            for pos_key in list(self.open_positions.keys()):
-                if pos_key.startswith('kalshi:'):
-                    pos = self.open_positions[pos_key]
-                    pos_ticker = pos.get('market_ticker')
-                    
-                    if pos_ticker and (pos_ticker == home_ticker or pos_ticker == away_ticker):
-                        # Found a match! Migrate to proper game_id key
-                        print(f"  ℹ️ Matched position {pos_key} -> {game_id}")
-                        self.open_positions[game_id] = self.open_positions.pop(pos_key)
-                        return game_id
+            if not pos_ticker:
+                continue
+            
+            matched = False
+            
+            # Exact ticker match
+            if odds and (pos_ticker == odds.get('home_ticker') or pos_ticker == odds.get('away_ticker')):
+                matched = True
+            
+            # Event stem match (catches home_no vs away_yes on same event)
+            if not matched and game_stems:
+                pos_stem = self._ticker_event_stem(pos_ticker)
+                if pos_stem and pos_stem in game_stems:
+                    matched = True
+            
+            if matched:
+                if pos_key != game_id:
+                    print(f"  ℹ️ Matched position {pos_key} -> {game_id}")
+                    self.open_positions[game_id] = self.open_positions.pop(pos_key)
+                return game_id
         
         return None
     
@@ -2605,8 +2667,8 @@ class PaperTrader:
                             self.exit_cooldowns[cooldown_key] = (exit_info.get('time_remaining_sec', 0), self.COOLDOWN_AFTER_EXIT, "Ticker not in Kalshi positions")
                         return
                 except Exception as e:
-                    print(f"  ⚠️ Could not verify position side: {e}")
-                    # Continue with tracked side - risky but order might still work
+                    print(f"  🛡️ Could not verify position side: {e} — BLOCKING sell for safety")
+                    return  # If we can't verify, don't risk opening a short
                 
                 # For IOC exits, accept slightly worse price to guarantee fill
                 # Bid can move between when we read it and when order arrives
@@ -2805,6 +2867,14 @@ class PaperTrader:
                 live_games = [g for g in games if g['status'] == 'in' and 'live_home_prob' in g]
                 upcoming_games = [g for g in games if g['status'] == 'pre' and 'pregame_home_prob' in g]
                 finished_games = [g for g in games if g['status'] == 'post']
+                
+                # Cache Kalshi positions once per cycle (avoid repeated API calls)
+                self._cached_kalshi_positions = None
+                if self.live_mode and self.kalshi_client:
+                    try:
+                        self._cached_kalshi_positions = self.kalshi_client.get_positions()
+                    except Exception as e:
+                        print(f"  ⚠️ Failed to cache Kalshi positions: {e}")
                 
                 # Check for settlements on finished games
                 for game in finished_games:
@@ -3281,6 +3351,23 @@ class PaperTrader:
         market_source = opp.get('market_source', 'Kalshi')
         contract_type = opp.get('contract_type', f'{side}_yes')  # e.g., home_yes, away_no
         
+        # === SAFETY: Check for existing position on same EVENT (not just same game_id) ===
+        # Prevents doubling up via different contract types (e.g., home_no + away_yes)
+        opp_ticker = opp.get('market_ticker')
+        if opp_ticker:
+            opp_stem = self._ticker_event_stem(opp_ticker)
+            if opp_stem:
+                for pos_key, pos in self.open_positions.items():
+                    pos_ticker = pos.get('market_ticker')
+                    if pos_ticker:
+                        pos_stem = self._ticker_event_stem(pos_ticker)
+                        if pos_stem == opp_stem:
+                            existing_ct = pos.get('contract_type', 'unknown')
+                            if existing_ct != contract_type:
+                                print(f"\n  🛡️ BLOCKED: Already have {existing_ct} on this event, won't add {contract_type}")
+                                return
+                            # Same contract type = top-up, allowed to continue
+        
         # === LIVE TRADING: Place order FIRST ===
         live_fill_count = 0
         live_avg_price = None
@@ -3289,52 +3376,45 @@ class PaperTrader:
         if self.live_mode and self.kalshi_client and market_source == 'Kalshi':
             ticker = opp.get('market_ticker')
             if ticker:
-                # === SAFETY CHECK: Verify position and calculate order size ===
+                # === HARD CAP: Fresh Kalshi query as SOLE source of truth ===
                 contracts_to_order = self.live_contracts
-                
-                # Cap based on tracked position (handles cross-contract top-ups)
-                if game_id in self.open_positions:
-                    existing_pos = self.open_positions[game_id]
-                    # Safety: only top-up with same contract type (don't mix home_yes with away_no)
-                    existing_ct = existing_pos.get('contract_type', '')
-                    if existing_ct and existing_ct != contract_type:
-                        return  # Wrong contract type for this position
-                    existing_tracked = existing_pos.get('live_fill_count', 0)
-                    contracts_to_order = max(0, self.live_contracts - existing_tracked)
-                    if contracts_to_order <= 0:
-                        return  # Already at full size across all contracts
-                    print(f"  📈 TOP-UP: {existing_tracked}/{self.live_contracts} filled, ordering {contracts_to_order} more")
-                
                 try:
-                    kalshi_positions = self.kalshi_client.get_positions()
-                    if ticker in kalshi_positions and kalshi_positions[ticker].yes_count != 0:
-                        existing_count = abs(kalshi_positions[ticker].yes_count)
-                        if existing_count >= self.live_contracts:
-                            print(f"\n  ⚠️ BLOCKED: Already have {existing_count} contracts on {ticker}")
-                            # Add to open_positions to prevent future attempts
-                            if game_id not in self.open_positions:
-                                self.open_positions[game_id] = {
-                                    'trade_id': None,
-                                    'side': side,
-                                    'entry_price': kalshi_positions[ticker].yes_avg_price / 100.0,
-                                    'entry_time': None,
-                                    'entry_status': 'unknown',
-                                    'home_team': opp['home_team'],
-                                    'away_team': opp['away_team'],
-                                    'market_ticker': ticker,
-                                    'market_source': 'Kalshi',
-                                    'contract_type': contract_type,
-                                    'live_fill_count': existing_count,
-                                    'live_avg_price': kalshi_positions[ticker].yes_avg_price,
-                                    'live_order_id': None
-                                }
-                            return  # Already at full size!
-                        else:
-                            ticker_remaining = self.live_contracts - existing_count
-                            contracts_to_order = min(contracts_to_order, ticker_remaining)
-                            print(f"  📈 TOP-UP: Have {existing_count} on ticker + {self.live_contracts - contracts_to_order - existing_count} other, ordering {contracts_to_order} more")
+                    fresh_positions = self.kalshi_client.get_positions()  # Returns Dict[str, Position]
+                    opp_stem = self._ticker_event_stem(ticker)
+                    
+                    # Count ALL contracts across ALL tickers on this event
+                    total_event_contracts = 0
+                    for k_ticker, k_pos in fresh_positions.items():
+                        if k_pos.yes_count != 0:
+                            k_stem = self._ticker_event_stem(k_ticker)
+                            if k_stem and k_stem == opp_stem:
+                                total_event_contracts += abs(k_pos.yes_count)
+                    
+                    if total_event_contracts >= self.live_contracts:
+                        print(f"\n  🛡️ HARD CAP: Already {total_event_contracts} contracts on event (target={self.live_contracts})")
+                        # Register in open_positions so we stop checking
+                        if game_id not in self.open_positions:
+                            self.open_positions[game_id] = {
+                                'trade_id': None, 'side': side, 'entry_price': entry_price,
+                                'entry_time': None, 'entry_status': 'unknown',
+                                'home_team': opp['home_team'], 'away_team': opp['away_team'],
+                                'market_ticker': ticker, 'market_source': 'Kalshi',
+                                'contract_type': contract_type,
+                                'live_fill_count': total_event_contracts,
+                                'live_avg_price': None, 'live_order_id': None
+                            }
+                        return
+                    
+                    contracts_to_order = min(contracts_to_order, self.live_contracts - total_event_contracts)
+                    if contracts_to_order <= 0:
+                        return
+                    
+                    if total_event_contracts > 0:
+                        print(f"  📈 TOP-UP: {total_event_contracts}/{self.live_contracts} on Kalshi, ordering {contracts_to_order} more")
+                        
                 except Exception as e:
-                    print(f"  ⚠️ Could not verify existing position: {e}")
+                    print(f"  🛡️ Fresh position check failed: {e} — BLOCKING order for safety")
+                    return  # If we can't verify, don't risk over-accumulation
                 
                 kalshi_side = OrderSide.NO if '_no' in contract_type else OrderSide.YES
                 
