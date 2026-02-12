@@ -1047,6 +1047,18 @@ class PaperTrader:
     COOLDOWN_AFTER_EXIT = 30  # 30 second cooldown after any exit
     COOLDOWN_AFTER_STOP = 240  # 4 minutes after stop loss (if ever re-enabled)
     
+    # Microstate haircut (exits only) — calibrated from live_snapshots
+    # Late in close games, MMs see possession/FT/fouls our model can't.
+    # H_eff = K × g(t) × SCALE × exp(-t/TAU) × exp(-|m|/MARGIN_DECAY) if |m| <= MARGIN_MAX
+    # where g(t) ramps linearly from 0 at RAMP_HI to 1 at RAMP_LO
+    HAIRCUT_SCALE = 26.94     # Peak excess dispersion (cents) at t=0, m=0
+    HAIRCUT_TAU = 119         # Time decay constant (seconds)
+    HAIRCUT_MARGIN_DECAY = 1.5  # Margin decay constant (points)
+    HAIRCUT_K = 0.75          # Conservative scale factor (tunable)
+    HAIRCUT_RAMP_HI = 240     # g(t)=0 above this (seconds)
+    HAIRCUT_RAMP_LO = 120     # g(t)=1 below this (seconds)
+    HAIRCUT_MARGIN_MAX = 5    # No haircut if |margin| > this
+    
     # ESPN score freshness guard
     # Only enter/exit when ESPN score data is recently updated.
     # Prevents phantom edges from stale ESPN scores after Kalshi has already priced in a basket.
@@ -1061,7 +1073,7 @@ class PaperTrader:
         
         Pregame (time_remaining >= 2400) uses 5%
         """
-        E_START = 0.05  # 5% at game start / pregame
+        E_START = 0.06  # 6% at game start / pregame
         E_END = 0.15    # 15% at 4:00 remaining (MIN_TIME_REMAINING)
         T_START = 2400  # 40:00 (full game)
         T_END = 240     # 4:00 (MIN_TIME_REMAINING cutoff)
@@ -1191,17 +1203,18 @@ class PaperTrader:
             return 0.0
         return self.OV_SCALE * (N ** self.OV_EXPONENT) * (1 + self.OV_PROB_COEFF * prob * (1 - prob))
     
-    def compute_min_sell_bid(self, time_remaining_sec: int, our_prob: float) -> float:
+    def compute_min_sell_bid(self, time_remaining_sec: int, our_prob: float, abs_margin: int = 0) -> float:
         """Compute minimum bid (in cents) needed to trigger an EV exit.
         
-        Solves: bid - fee(bid) = our_prob * 100 + OV
+        Solves: bid - fee(bid) = our_prob * 100 + OV + haircut
         Uses iterative Newton steps from initial guess bid₀ = ev_hold.
         
         Returns:
             Minimum bid in cents to justify selling, or 100 if hold-to-settlement.
         """
         ov = self.compute_option_value(time_remaining_sec, our_prob)
-        ev_hold = our_prob * 100 + ov
+        haircut = self.compute_haircut(time_remaining_sec, abs_margin)
+        ev_hold = our_prob * 100 + ov + haircut
         
         if ev_hold >= 99:
             return 100.0  # Effectively "hold forever"
@@ -1214,6 +1227,36 @@ class PaperTrader:
             bid = ev_hold + fee
         
         return min(99.0, max(1.0, bid))
+    
+    def compute_haircut(self, time_remaining_sec: int, abs_margin: int) -> float:
+        """Compute microstate uncertainty premium (cents) for exit threshold.
+        
+        Late in close games, market makers observe microstate (possession, FT,
+        foul count, shot clock) that our model is blind to. This raises ev_hold
+        so we only sell when market overpays enough to overcome our info gap.
+        
+        Gated: only applies when |margin| <= 5 and time < 4:00, ramping in
+        from 4:00 to full strength at 2:00.
+        
+        Calibrated from excess residual dispersion in (time, margin) buckets
+        using margin-conditional baselines from first-half data.
+        """
+        # Margin gate: no haircut if game isn't close
+        if abs_margin > self.HAIRCUT_MARGIN_MAX:
+            return 0.0
+        
+        # Time ramp: 0 above RAMP_HI, linear ramp, 1 below RAMP_LO
+        if time_remaining_sec >= self.HAIRCUT_RAMP_HI:
+            return 0.0
+        elif time_remaining_sec <= self.HAIRCUT_RAMP_LO:
+            g = 1.0
+        else:
+            g = (self.HAIRCUT_RAMP_HI - time_remaining_sec) / (self.HAIRCUT_RAMP_HI - self.HAIRCUT_RAMP_LO)
+        
+        # Raw exponential surface
+        h_raw = self.HAIRCUT_SCALE * math.exp(-time_remaining_sec / self.HAIRCUT_TAU) * math.exp(-abs_margin / self.HAIRCUT_MARGIN_DECAY)
+        
+        return max(0.0, self.HAIRCUT_K * g * h_raw)
     
     def _load_predictions(self):
         """Load today's predictions (uses yesterday if before 4am)"""
@@ -2530,7 +2573,8 @@ class PaperTrader:
         time_remaining = game.get('time_remaining_sec', 0) or 0
         
         ov = self.compute_option_value(time_remaining, our_prob)
-        ev_hold = our_prob * 100 + ov
+        haircut = self.compute_haircut(time_remaining, abs(home_score - away_score))
+        ev_hold = our_prob * 100 + ov + haircut
         
         # EV_exit = current_bid - exit_fee - slippage
         bid_decimal = current_bid_cents / 100.0
@@ -2541,7 +2585,7 @@ class PaperTrader:
         
         if ev_exit > ev_hold:
             ev_diff = ev_exit - ev_hold
-            exit_reason = f"EV EXIT: Sell@{current_bid_cents:.0f}¢ (EV={ev_exit:.1f}) > Hold (EV={ev_hold:.1f}) | +{ev_diff:.1f}¢ EV"
+            exit_reason = f"EV EXIT: Sell@{current_bid_cents:.0f}¢ (EV={ev_exit:.1f}) > Hold (EV={ev_hold:.1f}, H={haircut:.1f}¢) | +{ev_diff:.1f}¢ EV"
         
         if exit_reason:
             return {
@@ -2828,6 +2872,7 @@ class PaperTrader:
         print("═"*80)
         print(f"  Entry: 5%→15% edge (exp k=2) │ Spread: 3¢/2¢")
         print(f"  Exit: EV-based (OV={self.OV_SCALE}×N^{self.OV_EXPONENT}) │ Cooldown: {self.COOLDOWN_AFTER_EXIT}s game-time")
+        print(f"  Haircut: k={self.HAIRCUT_K} × H(t,|m|), ramp {self.HAIRCUT_RAMP_HI//60}:{self.HAIRCUT_RAMP_HI%60:02d}→{self.HAIRCUT_RAMP_LO//60}:{self.HAIRCUT_RAMP_LO%60:02d}, |m|≤{self.HAIRCUT_MARGIN_MAX}")
         ws_str = "WS" if KALSHI_WS_AVAILABLE else "REST"
         print(f"  Data: {ws_str}")
         if self.live_mode:
@@ -3294,7 +3339,8 @@ class PaperTrader:
                         if side == 'away':
                             our_prob = 1 - our_prob
                         time_rem = current_game.get('time_remaining_sec', 2400)
-                        min_sell = self.compute_min_sell_bid(time_rem, our_prob)
+                        abs_margin = abs(current_game.get('home_score', 0) - current_game.get('away_score', 0))
+                        min_sell = self.compute_min_sell_bid(time_rem, our_prob, abs_margin)
                         
                         print(f"  {matchup:<40} {type_label}{venue:<5} {pos['entry_price']*100:5.0f}¢ {p['current_bid']*100:5.0f}¢ {min_sell:5.0f}¢ {pnl_cents:+5.0f}¢ {status:<10}")
                 

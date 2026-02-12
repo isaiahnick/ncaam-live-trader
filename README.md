@@ -100,11 +100,11 @@ EV_hold = model_probability × 100¢
 
 But this misses something crucial: **settlement is free**. If you hold to game end, you pay zero exit fees. If you sell mid-game, you pay up to 1.75¢ in fees.
 
-This asymmetry makes the case obvious, but the deeper point doesn't depend on fees at all. Even in a zero-fee market, you have the **right but not the obligation** to sell at any point. You'll only sell when the bid exceeds your continuation value — and the expected value of "sell only when it's profitable, hold otherwise" is strictly greater than the expected value of holding to settlement, as long as there's any noise in the market. That's the fundamental option payoff: E[max(bid - continuation, 0)] > 0 whenever market noise exists.
+This asymmetry makes the case obvious, but the deeper point doesn't depend on fees at all. Even in a zero-fee market, you have the **right but not the obligation** to sell at any point. You'll only sell when the bid exceeds your continuation value — and the expected value of "sell only when it's profitable, hold otherwise" is strictly greater than the expected value of holding to settlement, as long as there's any noise in the market. That's gamma: E[max(bid - continuation, 0)] > 0 whenever market noise exists.
 
 The fee asymmetry just widens the gap. The naive approach says "sell whenever the bid exceeds fair value," but fees eat into those marginal sells. Free settlement raises the bar for exercising the option — you need the market to overprice by enough to justify the transaction cost — which makes the hold decision correct more often than it would be in a frictionless market.
 
-This is mathematically identical to an American-style option. And like any option, it has quantifiable value.
+This is mathematically identical to an American-style option. And like any option, it has quantifiable value. A trade that is rational to enter is not automatically rational to exit.
 
 ---
 
@@ -143,7 +143,7 @@ How often does the market actually overprice in our favor?
 
 About 15% of the time, the market bids 4¢+ above our model's fair value. That's the optionality we're capturing.
 
-But the global average obscures something important: **noise is not constant across probability levels.** When I conditioned the residual analysis on the model's win probability at each snapshot, a striking pattern emerged.
+But the global average obscures something important: **noise is not constant across probability levels.** When I conditioned the residual analysis on the model's win probability at each snapshot, the pattern that emerged was immediately recognizable — it's gamma.
 
 ![Market noise conditioned on win probability](images/conditional_noise.png)
 
@@ -155,9 +155,9 @@ But the global average obscures something important: **noise is not constant acr
 | 70% | 5.7¢ | 0.85x |
 | 90% (decided game) | 2.7¢ | 0.40x |
 
-Market noise varies by over 5x depending on how contested the game is. In close games, there's genuine disagreement between participants about the outcome, and the bid bounces around substantially. In decided games — where the model gives one side 90%+ — everyone agrees on the price, and the bid barely moves.
+Market noise varies by over 5x depending on how contested the game is, and the shape is no accident — it follows p(1-p), the gamma of a binary option. In close games (peak gamma), there's genuine disagreement between participants about the outcome, and the bid bounces around substantially. In decided games (near-zero gamma), everyone agrees on the price, and the bid barely moves. The convexity of the payoff determines how much noise there is to harvest.
 
-This has a direct consequence for option value. A position in a contested game has many potential sell opportunities from large noise fluctuations. A position in a decided game has very few — the bid is pinned near the model's fair value and rarely deviates enough to make selling worthwhile.
+This has a direct consequence for option value. A position in a contested game sits at peak gamma — large noise fluctuations create many potential sell opportunities. A position in a decided game has effectively zero gamma — the bid is pinned near the model's fair value and rarely deviates enough to make selling worthwhile.
 
 ---
 
@@ -179,7 +179,7 @@ The position's value equals the expected continuation value plus a "sell premium
 V(state, time) = E[V(next_state, time-1)] + sell_premium
 ```
 
-The sell premium at each step is a call option on the bid price. If the bid is normally distributed around fair value, the premium from selling only when profitable follows the standard option payoff formula:
+The sell premium at each step is a call option on the bid price — you're harvesting gamma from market noise. If the bid is normally distributed around fair value, the premium from selling only when profitable follows the standard option payoff formula:
 
 ```
 sell_premium = σ(p) × φ(d) + (μ_sell - continuation) × Φ(d)
@@ -187,7 +187,7 @@ sell_premium = σ(p) × φ(d) + (μ_sell - continuation) × Φ(d)
 
 Where σ(p) is the probability-conditioned market noise at the current state, and μ_sell is the expected sell proceeds net of fees. This is the exact same mathematics as a European call — the expected value of max(bid - continuation, 0) under a normal distribution.
 
-Critically, the backward induction uses the conditional noise measured earlier — σ(p) rather than a single global σ. At each node, the sell premium is computed using the noise level appropriate for that probability. A node at p = 0.50 sees σ = 6.7¢ and gets substantial sell premium. A node at p = 0.90 sees σ = 2.7¢ and gets much less. This means the BI naturally produces lower option values for positions in decided games and higher values for contested ones — the asymmetry emerges from the physics rather than being imposed after the fact.
+Critically, the backward induction uses the conditional noise measured earlier — σ(p) rather than a single global σ. At each node, the sell premium is computed using the noise level appropriate for that probability. A node at p = 0.50 sees σ = 6.7¢ and gets substantial sell premium. A node at p = 0.90 sees σ = 2.7¢ and gets much less. This means the BI naturally produces lower option values for positions in decided games and higher values for contested ones — the asymmetry emerges from the physics rather than being imposed after the fact. And the equilibrium it finds is the same no-free-lunch constraint that underlies Black-Scholes: at every node, the theta you burn (option value decaying each timestep) is exactly offset by the gamma you expect to harvest from market noise, adjusted for the fee savings of holding to settlement.
 
 But there's a subtlety. Backward induction treats every timestep as an independent sell opportunity. In reality, market noise is autocorrelated — a mispricing at time *t* is partially correlated with the mispricing at *t + 30 seconds*. If you use 30-second steps, you'd be counting correlated opportunities as independent, inflating the option value.
 
@@ -217,15 +217,13 @@ Where:
 - **N = time_remaining / 120** — the number of independent sell opportunities remaining
 - **p** — the model's current win probability for our side
 
-This is analogous to the relationship between the binomial tree and Black-Scholes. The binomial tree (backward induction) solves the problem exactly on a discrete grid. Black-Scholes (the formula) captures the same economics in closed form — no grid, no file, no lookup. Nobody would say Black-Scholes isn't real option pricing; it's just a different solution method. Same situation here.
+This is analogous to the relationship between the binomial tree and Black-Scholes. The binomial tree (backward induction) solves the problem exactly on a discrete grid. Black-Scholes (the formula) captures the same economics in closed form — no grid, no file, no lookup. And just as Black-Scholes decomposes into Greeks, so does this formula:
 
-Each term has a clear financial interpretation:
-
-**N^0.42** — Sublinear growth in sell opportunities. Doubling your remaining time doesn't double your option value, because you only need *one* good exit. Same reason buying 10 lottery tickets isn't 10x as valuable as buying one. The 0.42 exponent emerges naturally from the diminishing marginal value of additional independent draws from a noise distribution.
+**N^0.42 — Theta.** Option value bleeds away as the game clock runs down. Each tick of time that passes is one fewer independent sell opportunity. Doubling your remaining time doesn't double your option value, because you only need *one* good exit. The 0.42 exponent emerges naturally from the diminishing marginal value of additional independent draws from a noise distribution.
 
 **0.39** — The base scale factor per sell opportunity, reflecting the expected positive part of the noise distribution discounted by the negative mean bias (bids typically sit below fair value) and the cost of exercising.
 
-**(1 + 16.12 × p(1-p))** — The noise shape adjustment. This is the dominant term and directly reflects the conditional noise structure: p(1-p) peaks at p = 0.50 and drops to zero at the extremes, exactly mirroring the empirical σ(p) curve. In a contested game (p near 0.50), market noise is large and sell opportunities are abundant, so option value is high. In a decided game (p near 0 or 1), the market barely moves and there's little optionality to capture. At p = 0.50, this multiplier reaches its maximum of 5.03×; at p = 0.90, it drops to 2.45×.
+**(1 + 16.12 × p(1-p)) — Gamma.** This is the dominant term. p(1-p) is the gamma of a binary option: it peaks at p = 0.50 and drops to zero at the extremes, exactly mirroring the empirical σ(p) curve. In a contested game, gamma is high, market noise is large, and sell opportunities are abundant. In a decided game, gamma is near zero, the market barely moves, and there's little optionality to capture. At p = 0.50, this multiplier reaches its maximum of 5.03×; at p = 0.90, it drops to 2.45×.
 
 The formula is re-calibrated periodically as more market data accumulates — measuring fresh conditional noise parameters σ(p), running backward induction with probability-dependent noise at DT=120, and refitting the three coefficients.
 
@@ -242,9 +240,9 @@ The formula is re-calibrated periodically as more market data accumulates — me
 | -15 | 5.7¢ | 3.1¢ | 1.4¢ | 0.7¢ | 0.4¢ |
 
 Key observations:
-- Option value peaks in contested games (score near 0) where market noise is highest — around 5-7¢ with substantial time remaining
-- It decays sublinearly — even with 5 minutes left, close games still carry 2-3¢ of optionality
-- Lopsided scores have *lower* option value. When the game is decided, the market barely moves and there's little optionality to capture. A +15 position at halftime has only 2.2¢ of option value compared to 5.1¢ for a tied game — reflecting the 5.5× difference in market noise between decided and contested games
+- Option value peaks in contested games (score near 0) where gamma is highest — around 5-7¢ with substantial time remaining
+- Theta decay is sublinear — even with 5 minutes left, close games still carry 2-3¢ of optionality
+- Lopsided scores have *lower* option value because gamma collapses. A +15 position at halftime has only 2.2¢ of option value compared to 5.1¢ for a tied game — reflecting the 5.5× difference in market noise between decided and contested games
 
 ---
 
@@ -273,7 +271,44 @@ Option value = 5.0¢ (from formula: 0.39 × 10^0.42 × 4.87)
 Exit threshold = 60 + 5.0 + 1.7 = 66.7¢
 ```
 
-We only sell if Kalshi bids above 67¢ — nearly 7¢ above our model's fair value. The market needs to meaningfully overprice for us to give up the remaining optionality in a contested game. But with 20 minutes left and the game up by 15 (model probability ~93%), the option value drops to just 2.2¢ and the exit threshold tightens — we're quicker to lock in profits when the market has little room to move.
+We only sell if Kalshi bids above 67¢ — nearly 7¢ above our model's fair value. The market needs to meaningfully overprice for us to give up the remaining gamma in a contested game. But with 20 minutes left and the game up by 15 (model probability ~93%), gamma has collapsed and theta has eaten most of the optionality — option value drops to just 2.2¢ and the exit threshold tightens.
+
+### The Microstate Haircut
+
+The option value framework captures everything about the *model's* uncertainty — how much time remains, how contested the game is, how noisy the market tends to be. But it misses an informational asymmetry that becomes acute in the final minutes of close games: market makers observe microstate that the model cannot.
+
+Possession, free throw situations, foul counts, timeout availability — none of these appear in the ESPN API feed that drives the model. With 20 minutes left and the game tied, these details barely matter; plenty of possessions remain and the microstate washes out. But with 90 seconds left and the score tied, who has the ball is the single most important variable. A market maker watching the broadcast prices this in; the model outputs "52%" when the true number might be anywhere from 35% to 70% depending on possession.
+
+This creates a specific failure mode: the model sees "bid = 62¢, model = 52¢, that's a 10¢ overprice — sell!" But the market isn't overpricing. It's correctly pricing a possession the model can't see.
+
+The fix is a **microstate haircut** — an additive premium on EV_hold that raises the exit threshold in exactly the regime where the model's informational disadvantage is largest. To calibrate it, I measured the excess dispersion of bid-model residuals in (time remaining, score margin) buckets, using margin-conditional baselines from first-half data to isolate the time-dependent microstate component from persistent close-game model-market disagreement.
+
+The pattern is clear: excess dispersion spikes inside 2 minutes in tied or one-point games, reaching nearly 15¢ — three times the global noise level. By |margin| ≥ 5, the effect vanishes entirely regardless of time. A residual signal remains measurable in the 4–6 minute range for close games, but diminishes rapidly beyond that. This is pure microstate: possession matters enormously when the game is tied with a minute left, and barely at all otherwise.
+
+A separable exponential fits the surface with 0.79¢ RMSE:
+
+```
+H_raw(t, |m|) = 26.94 × exp(-t / 119) × exp(-|m| / 1.5)
+```
+
+The time decay constant τ = 119 seconds means the effect halves roughly every 80 seconds — consistent with the intuition that possession information is consumed within a few trips down the court. The margin decay of 1.5 points means that by a 3-point lead, possession matters roughly 85% less.
+
+In production, the raw surface is gated to prevent it from distorting midgame behavior. A linear ramp activates the haircut below 4:00 remaining, reaching full strength at 2:00, and a margin gate zeroes it for |margin| > 5. A conservative scale factor of k = 0.75 provides a buffer against overfitting:
+
+```
+H_eff(t, |m|) = k × g(t) × H_raw(t, |m|)    if |m| ≤ 5, else 0
+
+where g(t) ramps from 0 at 4:00 to 1 at 2:00
+```
+
+The complete exit criterion becomes:
+
+```
+EV_hold = model_probability × 100 + option_value(time, prob) + H_eff(time, |margin|)
+Exit if: EV_exit > EV_hold
+```
+
+At 90 seconds, game tied: the haircut adds ~12¢ to the exit threshold — the system won't sell unless the market overpays by that much beyond what option value and fees already require. At 90 seconds, up by 3: the haircut drops to ~1¢. At 5 minutes, any score: zero. The modification is invisible for 95% of the game and surgically aggressive in the final minutes of close games, which is exactly where the model's blind spot lives.
 
 ---
 
@@ -290,8 +325,8 @@ The entry and exit curves are deliberately complementary:
 ![Entry edge threshold and option value curves](images/entry_exit_dance.png)
 
 This creates the right behavior:
-- **Early game:** Enter aggressively when our model has informational advantage, hold patiently through noise
-- **Late game:** Tighten entry requirements as micro-state info dominates, loosen grip on existing positions
+- **Early game:** Enter aggressively when our model has informational advantage, hold patiently through noise — theta is low and there's plenty of gamma to harvest
+- **Late game:** Tighten entry requirements as micro-state info dominates, loosen grip on existing positions as theta accelerates and remaining gamma dwindles
 
 The curves cross shortly after halftime — the inflection point where we shift from "accumulate and hold" to "protect and release."
 
@@ -364,14 +399,14 @@ Enter if:
 **Exit:**
 ```
 Exit if:
-  bid - fee > model × 100 + option_value(time, model_prob)
+  bid - fee > model × 100 + option_value(time, prob) + haircut(time, |margin|)
   ESPN score updated within 15 seconds
   
 Or at settlement:
   Receive 100¢ if win, 0¢ if lose (free, no fees)
 ```
 
-**Option value** is computed via closed-form formula calibrated to backward induction using probability-conditioned market noise — σ(p) ranges from 2.6¢ in decided games to 6.7¢ in contested ones. The formula is periodically re-fit as snapshot data grows.
+**Option value** is computed via closed-form formula calibrated to backward induction using probability-conditioned market noise — σ(p) ranges from 2.6¢ in decided games to 6.7¢ in contested ones. **Microstate haircut** adds an informational-disadvantage premium in the final minutes of close games, calibrated from excess residual dispersion and gated to activate only below 4:00 remaining at |margin| ≤ 5. Both are periodically re-fit as snapshot data grows.
 
 The system runs autonomously. A cron job at 4 AM processes completed games and regenerates predictions. The live trader fires up before tip-off, subscribes to WebSocket feeds, and makes rational EV-maximizing decisions every second until the last game settles.
 
@@ -381,12 +416,12 @@ The system runs autonomously. A cron job at 4 AM processes completed games and r
 
 The edge comes from three sources:
 
-1. **A better model** — The pregame ensemble captures information the market underweights, particularly early-season when data is scarce.
+1. **A better model** — The pregame ensemble captures information the market underweights, particularly early-season when data is scarce. That's the delta — the directional view.
 
-2. **Options-based position management** — By quantifying the embedded optionality of each position — the value of selectively exiting only when the market overprices — the system avoids the costly churn of selling and re-entering positions.
+2. **Options-based position management** — By quantifying the embedded gamma of each position — the value of selectively exiting only when the market overprices — the system harvests volatility rather than fighting it. The theta you pay to hold is more than offset by the gamma you collect from noise.
 
 3. **Speed and safety** — WebSocket integration, score freshness guards, and verification loops ensure the system trades on real edges, not stale data artifacts. Both entries and exits are gated on recent ESPN score updates to prevent adverse selection from the 10-20 second lag between live action and the API.
 
-The pregame model provides the directional view. The options framework turns that view into a trading strategy. The infrastructure executes it cleanly.
+The pregame model provides the directional view. The options framework turns that view into a gamma-harvesting strategy. The infrastructure executes it cleanly.
 
-Everything else is just math and discipline.
+Buy misbelief, hold optionality, monetize only forced overreaction. Everything else is just math and discipline.
