@@ -57,6 +57,7 @@ from scipy.stats import norm
 import math
 import sys
 import os
+import shutil
 import numpy as np
 
 # ===== LIVE TRADING IMPORT =====
@@ -73,34 +74,60 @@ try:
 except ImportError:
     KALSHI_WS_AVAILABLE = False
 
+# ===== POLYMARKET IMPORT =====
+try:
+    from polymarket_us import PolymarketUS
+    POLYMARKET_AVAILABLE = True
+except ImportError:
+    POLYMARKET_AVAILABLE = False
+
+# ===== POLYMARKET WEBSOCKET IMPORT =====
+try:
+    from polymarket_ws_orderbook import PolymarketWSOrderbook
+    POLY_WS_AVAILABLE = True
+except ImportError:
+    POLY_WS_AVAILABLE = False
+
+# ===== API CREDENTIALS (from environment variables) =====
+KALSHI_API_KEY = os.environ.get("KALSHI_API_KEY")
+KALSHI_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "/root/kalshi-key.key")
+POLY_KEY_ID = os.environ.get("POLY_KEY_ID")
+POLY_SECRET_KEY = os.environ.get("POLY_SECRET_KEY")
+
 # ===== FEE CALCULATIONS =====
 def kalshi_fee_cents(price: float) -> float:
     """Kalshi fee: 7% × P × (1-P) × 100 cents, capped at 1.75¢"""
     return min(0.07 * price * (1 - price) * 100, 1.75)
 
 
-def calculate_net_ev(prob: float, ask: float, spread: float) -> float:
+def poly_fee_cents(price: float) -> float:
+    """Polymarket fee: 10 basis points (0.1%) taker, 0 maker. Price in 0-1 range."""
+    return 0.001 * price * 100
+
+
+def calculate_net_ev(prob: float, ask: float, spread: float, venue: str = 'Kalshi') -> float:
     """
-    Calculate net expected value for a Kalshi trade, accounting for fees and spread.
+    Calculate net expected value for a trade, accounting for fees and spread.
     
     Args:
         prob: Our model's probability (0-1)
         ask: Entry price we'd pay (0-1)
         spread: Bid-ask spread in cents
+        venue: 'Kalshi' or 'Polymarket'
     
     Returns:
         Net EV in cents
-    
-    Formula:
-        net_EV = gross_edge - entry_fee - expected_exit_fee - (spread / 2)
-    
-    We estimate exit at prob (fair value) since ~80% of trades exit via edge collapse.
-    Spread/2 accounts for exit slippage.
     """
     gross_edge_cents = (prob - ask) * 100
-    entry_fee = kalshi_fee_cents(ask)
-    exit_fee = kalshi_fee_cents(prob)  # Estimate exit at fair value
-    spread_cost = spread / 2  # Half spread as exit slippage estimate
+    
+    if venue == 'Polymarket':
+        entry_fee = poly_fee_cents(ask)
+        exit_fee = poly_fee_cents(prob)
+    else:
+        entry_fee = kalshi_fee_cents(ask)
+        exit_fee = kalshi_fee_cents(prob)
+    
+    spread_cost = spread / 2
     
     return gross_edge_cents - entry_fee - exit_fee - spread_cost
 
@@ -696,6 +723,28 @@ def normalize_team_name(name: str) -> str:
     return TEAM_NAME_MAP.get(name, name)
 
 
+def get_terminal_width() -> int:
+    """Get current terminal width with fallback"""
+    try:
+        return shutil.get_terminal_size((120, 40)).columns
+    except:
+        return 120
+
+def get_layout():
+    """Return layout parameters based on terminal width.
+    Desktop (>=100): full wide layout
+    Mobile (<100): compact layout for Termius/phone"""
+    w = get_terminal_width()
+    compact = w < 100
+    return {
+        'width': w,
+        'compact': compact,
+        'sep_width': min(w - 2, 120) if not compact else w - 2,
+        'team_width': 12 if compact else 18,
+        'matchup_width': 28 if compact else 40,
+    }
+
+
 def fetch_kalshi_odds() -> dict:
     """Fetch today's CBB odds from Kalshi using markets endpoint with pagination"""
     # If before 4am, use yesterday's date (games run late)
@@ -828,6 +877,129 @@ def fetch_kalshi_odds() -> dict:
         odds[kalshi_away_norm] = game_odds
         odds[kalshi_home_norm] = game_odds
         matched += 1
+    
+    print(f" done ({matched} with prices)")
+    return odds
+
+
+def fetch_polymarket_odds(poly_client) -> dict:
+    """Fetch today's CBB moneyline odds from Polymarket US.
+    
+    Uses series 7 (CBB 2025). Slug format: aec-cbb-{away}-{home}-{YYYY-MM-DD}
+    BBO represents the outcome team (away team for CBB, ordering='away').
+    
+    Returns dict keyed by normalized team name, matching Kalshi odds format.
+    """
+    if not poly_client:
+        return {}
+    
+    # Use same date logic as predictions (yesterday if before 4am)
+    now = datetime.now()
+    if now.hour < 4:
+        effective_date = now - timedelta(days=1)
+    else:
+        effective_date = now
+    today_str = effective_date.strftime('%Y-%m-%d')
+    
+    print(f"  Fetching Polymarket markets...", end='', flush=True)
+    
+    try:
+        ev_list = []
+        offset = 0
+        while True:
+            events = poly_client.events.list({
+                "seriesId": [7],
+                "active": True,
+                "closed": False,
+                "limit": 100,
+                "offset": offset,
+            })
+            batch = events.get('events', [])
+            ev_list.extend(batch)
+            if len(batch) < 100:
+                break
+            offset += 100
+    except Exception as e:
+        print(f" error: {e}")
+        return {}
+    
+    # Filter to today's events by slug date
+    today_events = [e for e in ev_list if today_str in e.get('slug', '')]
+    print(f" {len(today_events)} today...", end='', flush=True)
+    
+    odds = {}
+    matched = 0
+    
+    for ev in today_events:
+        title = ev.get('title', '')
+        slug = ev.get('slug', '')
+        
+        if ' vs. ' not in title:
+            continue
+        
+        # Parse team names from title: "Away vs. Home" (ordering='away' for CBB)
+        parts = title.split(' vs. ')
+        if len(parts) != 2:
+            continue
+        
+        away_name = parts[0].strip()
+        home_name = parts[1].strip()
+        away_norm = normalize_team_name(away_name)
+        home_norm = normalize_team_name(home_name)
+        
+        # Fetch BBO for this market
+        try:
+            bbo = poly_client.markets.bbo(slug)
+            md = bbo.get('marketData', {})
+            best_bid = md.get('bestBid', {})
+            best_ask = md.get('bestAsk', {})
+            
+            if not best_bid or not best_ask:
+                continue
+            
+            bid_val = float(best_bid.get('value', 0))
+            ask_val = float(best_ask.get('value', 0))
+            
+            if bid_val <= 0.01 or ask_val <= 0.01:
+                continue
+            
+            # BBO is for outcome team (away in CBB)
+            away_bid_cents = bid_val * 100
+            away_ask_cents = ask_val * 100
+            
+            # Home prices are inverted (short side)
+            home_bid_cents = 100 - away_ask_cents
+            home_ask_cents = 100 - away_bid_cents
+            
+            game_odds = {
+                'poly_away': away_name,
+                'poly_home': home_name,
+                'poly_away_norm': away_norm,
+                'poly_home_norm': home_norm,
+                'home_prob': (home_bid_cents + home_ask_cents) / 200.0,
+                'away_prob': (away_bid_cents + away_ask_cents) / 200.0,
+                'home_yes_bid': home_bid_cents,
+                'home_yes_ask': home_ask_cents,
+                'away_yes_bid': away_bid_cents,
+                'away_yes_ask': away_ask_cents,
+                # No NO contracts on Polymarket
+                'home_no_bid': None,
+                'home_no_ask': None,
+                'away_no_bid': None,
+                'away_no_ask': None,
+                'home_ticker': None,
+                'away_ticker': None,
+                'title': title,
+                'slug': slug,
+                'source': 'Polymarket'
+            }
+            
+            odds[away_norm] = game_odds
+            odds[home_norm] = game_odds
+            matched += 1
+            
+        except Exception:
+            continue
     
     print(f" done ({matched} with prices)")
     return odds
@@ -982,6 +1154,15 @@ def setup_database(conn):
         ("live_snapshots", "away_no_ask", "REAL"),
         # Contract type for position persistence
         ("paper_trades", "contract_type", "TEXT"),
+        # Polymarket price columns
+        ("live_snapshots", "poly_home_bid", "REAL"),
+        ("live_snapshots", "poly_home_ask", "REAL"),
+        ("live_snapshots", "poly_away_bid", "REAL"),
+        ("live_snapshots", "poly_away_ask", "REAL"),
+        ("live_snapshots", "poly_home_edge", "REAL"),
+        ("live_snapshots", "poly_away_edge", "REAL"),
+        ("live_snapshots", "poly_slug", "TEXT"),
+        ("live_snapshots", "chosen_venue", "TEXT"),
     ]
     for table, col, dtype in new_columns:
         try:
@@ -1036,9 +1217,9 @@ class PaperTrader:
     # Option value formula (fit to backward induction with DT=120, σ=4.25¢, slip=0)
     # OV = OV_SCALE * N^OV_EXPONENT * (1 + OV_PROB_COEFF * p * (1-p))
     # where N = time_remaining / OV_DECORR_SEC (independent sell opportunities)
-    OV_SCALE = 0.39
-    OV_EXPONENT = 0.42
-    OV_PROB_COEFF = 16.12
+    OV_SCALE = 0.349
+    OV_EXPONENT = 0.4277
+    OV_PROB_COEFF = 17.2926
     OV_DECORR_SEC = 120  # Noise decorrelation timescale (empirical autocorrelation)
     
     # Stop loss and cooldown
@@ -1051,9 +1232,9 @@ class PaperTrader:
     # Late in close games, MMs see possession/FT/fouls our model can't.
     # H_eff = K × g(t) × SCALE × exp(-t/TAU) × exp(-|m|/MARGIN_DECAY) if |m| <= MARGIN_MAX
     # where g(t) ramps linearly from 0 at RAMP_HI to 1 at RAMP_LO
-    HAIRCUT_SCALE = 26.94     # Peak excess dispersion (cents) at t=0, m=0
-    HAIRCUT_TAU = 119         # Time decay constant (seconds)
-    HAIRCUT_MARGIN_DECAY = 1.5  # Margin decay constant (points)
+    HAIRCUT_SCALE = 28.27     # Peak excess dispersion (cents) at t=0, m=0
+    HAIRCUT_TAU = 112         # Time decay constant (seconds)
+    HAIRCUT_MARGIN_DECAY = 1.4  # Margin decay constant (points)
     HAIRCUT_K = 0.75          # Conservative scale factor (tunable)
     HAIRCUT_RAMP_HI = 240     # g(t)=0 above this (seconds)
     HAIRCUT_RAMP_LO = 120     # g(t)=1 below this (seconds)
@@ -1063,7 +1244,7 @@ class PaperTrader:
     # Only enter/exit when ESPN score data is recently updated.
     # Prevents phantom edges from stale ESPN scores after Kalshi has already priced in a basket.
     # Exception: if game clock is also stale (timeout/halftime), scores aren't changing so data is fine.
-    MAX_ESPN_SCORE_STALE_SEC = 15  # Max seconds since last ESPN score change during active play
+    MAX_ESPN_SCORE_STALE_SEC = 10  # Max seconds since last ESPN score change during active play
 
     def get_required_edge(self, entry_price: float, time_remaining: int = 2400) -> float:
         """Dynamic edge threshold based on time remaining (exponential ramp).
@@ -1073,7 +1254,7 @@ class PaperTrader:
         
         Pregame (time_remaining >= 2400) uses 5%
         """
-        E_START = 0.06  # 6% at game start / pregame
+        E_START = 0.08  # 8% at game start / pregame
         E_END = 0.15    # 15% at 4:00 remaining (MIN_TIME_REMAINING)
         T_START = 2400  # 40:00 (full game)
         T_END = 240     # 4:00 (MIN_TIME_REMAINING cutoff)
@@ -1089,12 +1270,15 @@ class PaperTrader:
             curved_progress = progress ** K  # Squaring makes it convex
             return E_START + curved_progress * (E_END - E_START)
     
-    def __init__(self, db_path: str, live_mode: bool = False, live_contracts: int = 10):
+    def __init__(self, db_path: str, live_mode: bool = False, live_contracts: int = 10, venue: str = 'best'):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path)
         self.model = LiveWinProbabilityModel()
         self.predictions = {}
         self.kalshi_odds = {}
+        self.polymarket_odds = {}
+        self.poly_client = None  # Polymarket US SDK client
+        self.venue = venue  # 'kalshi', 'polymarket', or 'best'
         self.open_positions = {}  # game_id -> position info
         self.exit_cooldowns = {}  # (game_id, side) -> (exit_game_time, cooldown_secs, reason)
         self.just_exited = set()  # game_ids that exited this tick (prevent instant re-entry)
@@ -1128,8 +1312,8 @@ class PaperTrader:
             print("=" * 70)
             try:
                 self.kalshi_client = KalshiLiveClient(
-                    api_key_id=os.environ['KALSHI_API_KEY_ID'],
-                    private_key_path='/root/kalshi-key.key',
+                    api_key_id=KALSHI_API_KEY,
+                    private_key_path=KALSHI_KEY_PATH,
                     use_demo=False,
                     max_position_size=100,
                     max_order_value_cents=5000
@@ -1161,8 +1345,8 @@ class PaperTrader:
         if KALSHI_WS_AVAILABLE and self.live_mode:
             try:
                 self.ws_book = KalshiWSOrderbook(
-                    api_key=os.environ['KALSHI_API_KEY_ID'],
-                    private_key_path='/root/kalshi-key.key',
+                    api_key=KALSHI_API_KEY,
+                    private_key_path=KALSHI_KEY_PATH,
                     verbose=False
                 )
                 self.ws_book.start()
@@ -1176,9 +1360,52 @@ class PaperTrader:
             except Exception as e:
                 print(f"  ⚠️ WebSocket init error: {e}, using REST fallback")
         
+        # ===== POLYMARKET CLIENT =====
+        if self.venue in ('polymarket', 'best') and POLYMARKET_AVAILABLE:
+            try:
+                self.poly_client = PolymarketUS(
+                    key_id=POLY_KEY_ID,
+                    secret_key=POLY_SECRET_KEY
+                )
+                bal = self.poly_client.account.balances()
+                poly_balance = bal.get('balances', [{}])[0].get('currentBalance', 0)
+                print(f"  ✓ Polymarket connected (balance: ${poly_balance:.2f})")
+            except Exception as e:
+                print(f"  ⚠️ Polymarket init error: {e} — Kalshi only")
+                self.poly_client = None
+        elif self.venue == 'kalshi':
+            print("  ℹ️ Venue: Kalshi only (--venue kalshi)")
+        else:
+            print("  ⚠️ polymarket-us not installed — Kalshi only")
+        
+        # ===== POLYMARKET WEBSOCKET =====
+        self.poly_ws_book = None
+        self.use_poly_ws = False
+        self._poly_ws_subscribed_slugs = set()
+        
+        if self.poly_client and POLY_WS_AVAILABLE and self.live_mode:
+            try:
+                self.poly_ws_book = PolymarketWSOrderbook(
+                    key_id=POLY_KEY_ID,
+                    secret_key=POLY_SECRET_KEY,
+                    verbose=False
+                )
+                self.poly_ws_book.start()
+                time.sleep(1)
+                
+                if self.poly_ws_book.connected:
+                    self.use_poly_ws = True
+                    print("  ✓ Polymarket WebSocket connected")
+                else:
+                    print("  ⚠️ Polymarket WebSocket failed, using REST fallback")
+            except Exception as e:
+                print(f"  ⚠️ Polymarket WebSocket init error: {e}, using REST fallback")
+        
         setup_database(self.conn)
         self._load_predictions()
         self._load_kalshi_odds()
+        if self.poly_client:
+            self._load_polymarket_odds()
         self._load_open_positions()  # In live mode, builds from Kalshi API; in paper mode, from DB
         self._load_realized_pnl()    # Restore P/L from today's completed trades
     
@@ -1203,11 +1430,14 @@ class PaperTrader:
             return 0.0
         return self.OV_SCALE * (N ** self.OV_EXPONENT) * (1 + self.OV_PROB_COEFF * prob * (1 - prob))
     
-    def compute_min_sell_bid(self, time_remaining_sec: int, our_prob: float, abs_margin: int = 0) -> float:
+    def compute_min_sell_bid(self, time_remaining_sec: int, our_prob: float, abs_margin: int = 0, venue: str = 'Kalshi') -> float:
         """Compute minimum bid (in cents) needed to trigger an EV exit.
         
         Solves: bid - fee(bid) = our_prob * 100 + OV + haircut
         Uses iterative Newton steps from initial guess bid₀ = ev_hold.
+        
+        Args:
+            venue: 'Kalshi' or 'Polymarket' — determines fee model used.
         
         Returns:
             Minimum bid in cents to justify selling, or 100 if hold-to-settlement.
@@ -1219,11 +1449,13 @@ class PaperTrader:
         if ev_hold >= 99:
             return 100.0  # Effectively "hold forever"
         
+        fee_fn = poly_fee_cents if venue == 'Polymarket' else kalshi_fee_cents
+        
         # Newton: bid - fee(bid) = ev_hold
         # Start with bid₀ = ev_hold, iterate: bid_{n+1} = ev_hold + fee(bid_n)
         bid = ev_hold
         for _ in range(3):
-            fee = kalshi_fee_cents(bid / 100.0)
+            fee = fee_fn(bid / 100.0)
             bid = ev_hold + fee
         
         return min(99.0, max(1.0, bid))
@@ -1300,14 +1532,22 @@ class PaperTrader:
         self.kalshi_odds = fetch_kalshi_odds()
         print(f"✓ Loaded {len(self.kalshi_odds) // 2} Kalshi markets")  # div 2 because indexed by both teams
     
+    def _load_polymarket_odds(self):
+        """Load current Polymarket odds for today's games"""
+        self.polymarket_odds = fetch_polymarket_odds(self.poly_client)
+        if self.polymarket_odds:
+            print(f"✓ Loaded {len(self.polymarket_odds) // 2} Polymarket markets")
+    
     def _load_open_positions(self):
-        """Load open positions - uses Kalshi API as source of truth in live mode.
+        """Load open positions - uses venue APIs as source of truth in live mode.
         
-        LIVE MODE: Builds positions entirely from Kalshi API. No paper_trades lookup.
+        LIVE MODE: Builds positions from Kalshi API + Polymarket API. No paper_trades lookup.
         PAPER MODE: Uses paper_trades table (legacy behavior).
         """
         if self.live_mode:
             self._build_positions_from_kalshi()
+            if self.poly_client:
+                self._build_positions_from_polymarket()
         else:
             self._load_positions_from_db()
     
@@ -1494,6 +1734,266 @@ class PaperTrader:
         
         return None
     
+    # ===== POLYMARKET POSITION MANAGEMENT =====
+    
+    def _get_poly_positions(self) -> Optional[dict]:
+        """Query current Polymarket positions/holdings from API.
+        
+        Returns dict keyed by slug -> {quantity, avg_price, side, net_position, ...} or None on failure.
+        
+        SDK response: {'positions': {'slug': {'netPosition': '20', 'cost': {'value': '10.58', ...}, ...}}}
+        netPosition positive = LONG, negative = SHORT.
+        """
+        if not self.poly_client:
+            return None
+        
+        try:
+            response = self.poly_client.portfolio.positions()
+            positions_dict = response.get('positions', {})
+            
+            # positions is a dict keyed by slug, not a list
+            if not isinstance(positions_dict, dict):
+                return {}
+            
+            result = {}
+            for slug, pos in positions_dict.items():
+                net_pos = int(float(pos.get('netPosition', '0')))
+                if net_pos == 0:
+                    continue
+                
+                quantity = abs(net_pos)
+                side = 'LONG' if net_pos > 0 else 'SHORT'
+                
+                # Avg price from cost / quantity
+                cost_val = float(pos.get('cost', {}).get('value', '0'))
+                avg_price = cost_val / quantity if quantity > 0 else 0
+                
+                result[slug] = {
+                    'quantity': quantity,
+                    'avg_price': avg_price,
+                    'side': side,
+                    'net_position': net_pos,
+                    'team_ordering': pos.get('marketMetadata', {}).get('team', {}).get('ordering', ''),
+                    'team_name': pos.get('marketMetadata', {}).get('team', {}).get('safeName', ''),
+                    'raw': pos
+                }
+            
+            return result
+            
+        except Exception as e:
+            print(f"  ⚠️ Polymarket positions API error: {e}")
+            return None
+    
+    def _build_positions_from_polymarket(self):
+        """Build open_positions entries from Polymarket API (LIVE MODE).
+        
+        Polymarket is a secondary source of truth alongside Kalshi.
+        Only adds positions not already covered by Kalshi.
+        """
+        poly_positions = self._get_poly_positions()
+        if poly_positions is None:
+            print("  ⚠️ Cannot build Polymarket positions - API unavailable")
+            return
+        
+        if not poly_positions:
+            print(f"✓ No open positions on Polymarket")
+            return
+        
+        loaded = 0
+        skipped = 0
+        
+        for slug, pos_data in poly_positions.items():
+            quantity = pos_data['quantity']
+            avg_price = pos_data['avg_price']
+            side_hint = pos_data.get('side', '')
+            
+            # Try to find matching Polymarket odds to get team names
+            matched_odds = None
+            for poly_key, odds in self.polymarket_odds.items():
+                if odds.get('slug') == slug:
+                    matched_odds = odds
+                    break
+            
+            if not matched_odds:
+                print(f"  ⚠️ Unknown Polymarket slug (no matching market): {slug}")
+                skipped += 1
+                continue
+            
+            # Determine side from intent/side field
+            # BUY_LONG on away team = betting away wins, side='away'
+            # BUY_SHORT on away team = betting home wins, side='home'
+            poly_away = matched_odds.get('poly_away', 'Unknown')
+            poly_home = matched_odds.get('poly_home', 'Unknown')
+            
+            if 'LONG' in side_hint.upper() or 'long' in side_hint.lower():
+                side = 'away'  # Long on outcome (away) team
+                contract_type = 'away_yes'
+            elif 'SHORT' in side_hint.upper() or 'short' in side_hint.lower():
+                side = 'home'  # Short on outcome team = bet on home
+                contract_type = 'home_yes'
+            else:
+                # Fallback: try to infer from price
+                # If avg_price < 50, likely bought a low-priced contract (underdog)
+                print(f"  ⚠️ Cannot determine side for {slug}, skipping")
+                skipped += 1
+                continue
+            
+            # Try to find game_id
+            game_id = self._find_game_id_for_teams(poly_home, poly_away)
+            if not game_id:
+                game_id = f"poly:{slug}"
+                print(f"  ⚠️ No game_id found for {poly_away} @ {poly_home}, using slug key")
+            
+            # Check if this game already has a Kalshi position
+            if game_id in self.open_positions:
+                existing = self.open_positions[game_id]
+                existing_venue = existing.get('market_source', 'Kalshi')
+                print(f"  ⚠️ Game {game_id} already has {existing_venue} position, skipping Polymarket")
+                skipped += 1
+                continue
+            
+            # Build position dict
+            # API cost/quantity already represents actual cost paid:
+            #   LONG: paid 30¢ for away token → entry = 0.30 (away_yes)
+            #   SHORT: paid 20¢ to short away → entry = 0.20 (home_yes, home-equivalent)
+            entry_price_decimal = avg_price if avg_price <= 1.0 else avg_price / 100.0
+            
+            self.open_positions[game_id] = {
+                'trade_id': None,
+                'side': side,
+                'entry_price': entry_price_decimal,
+                'entry_time': None,
+                'entry_status': 'unknown',
+                'home_team': poly_home,
+                'away_team': poly_away,
+                'market_ticker': slug,  # For Poly, market_ticker holds the slug
+                'market_source': 'Polymarket',
+                'contract_type': contract_type,
+                'live_fill_count': quantity,
+                'live_avg_price': round(entry_price_decimal * 100, 1),
+                'live_order_id': None
+            }
+            loaded += 1
+        
+        if loaded > 0:
+            print(f"✓ Loaded {loaded} positions from Polymarket API")
+            for game_id, pos in self.open_positions.items():
+                if pos.get('market_source') != 'Polymarket':
+                    continue
+                team = pos['home_team'] if pos['side'] == 'home' else pos['away_team']
+                contract = pos['contract_type'].replace('_', ' ').upper()
+                entry_cents = pos['entry_price'] * 100
+                count = pos['live_fill_count']
+                position_value = entry_cents * count / 100
+                print(f"  └─ {contract} {team[:20]} @ {entry_cents:.0f}¢ x{count} = ${position_value:.2f} [Poly]")
+        elif skipped > 0:
+            print(f"✓ No new Polymarket positions ({skipped} skipped/unmatched)")
+    
+    def _verify_poly_position(self, slug: str, expected_change: int, action: str = 'buy') -> Optional[int]:
+        """Verify a Polymarket position changed as expected after a trade.
+        
+        Args:
+            slug: Market slug
+            expected_change: Expected change in quantity (positive for buys, negative for sells)
+            action: 'buy' or 'sell' for logging
+            
+        Returns:
+            Actual quantity held after trade, or None if verification failed.
+        """
+        if not self.poly_client:
+            return None
+        
+        try:
+            time.sleep(0.5)  # Brief delay for Polymarket to update
+            poly_positions = self._get_poly_positions()
+            
+            if poly_positions is None:
+                print(f"  ⚠️ Could not verify Poly position (API unavailable)")
+                return None
+            
+            if slug in poly_positions:
+                actual_qty = poly_positions[slug]['quantity']
+                print(f"  ✓ VERIFIED: {slug} → {actual_qty} contracts on Polymarket")
+                return actual_qty
+            else:
+                if action == 'sell':
+                    print(f"  ✓ VERIFIED: Position closed on Polymarket")
+                    return 0
+                else:
+                    print(f"  ⚠️ Position not found on Polymarket after {action}")
+                    return None
+        except Exception as e:
+            print(f"  ⚠️ Poly verification error: {e}")
+            return None
+    
+    def _get_polymarket_portfolio(self) -> Optional[dict]:
+        """Get current Polymarket portfolio state for display.
+        
+        Returns dict with: cash, position_value, position_count, session_pnl
+        Mirrors _get_kalshi_portfolio() structure.
+        """
+        if not self.poly_client:
+            return None
+        
+        try:
+            # Get cash balance
+            bal = self.poly_client.account.balances()
+            cash = 0.0
+            balances = bal.get('balances', [])
+            if balances:
+                cash = float(balances[0].get('currentBalance', 0))
+            
+            # Get positions
+            poly_positions = self._get_poly_positions()
+            position_value = 0.0
+            cost_basis = 0.0
+            position_count = 0
+            
+            if poly_positions:
+                for slug, pos_data in poly_positions.items():
+                    qty = pos_data['quantity']
+                    avg = pos_data['avg_price']
+                    
+                    position_count += 1
+                    cost_basis += avg * qty
+                    
+                    # Use cashValue from API if available (most accurate)
+                    raw = pos_data.get('raw', {})
+                    cash_value = raw.get('cashValue', {}).get('value')
+                    if cash_value:
+                        position_value += float(cash_value)
+                    else:
+                        # Fallback: try current bid from live odds
+                        current_bid = None
+                        for team_key, odds in self.polymarket_odds.items():
+                            if odds.get('slug') == slug:
+                                if pos_data.get('side') == 'LONG':
+                                    current_bid = odds.get('away_yes_bid', 0) / 100.0
+                                else:
+                                    current_bid = odds.get('home_yes_bid', 0) / 100.0
+                                break
+                        
+                        if current_bid and current_bid > 0:
+                            position_value += current_bid * qty
+                        else:
+                            position_value += avg * qty  # Last resort: cost basis
+            
+            # currentBalance from Poly API INCLUDES position cost basis,
+            # so true free cash = currentBalance - cost_basis
+            free_cash = cash - cost_basis
+            total = free_cash + position_value
+            
+            return {
+                'cash': free_cash,
+                'position_value': position_value,
+                'cost_basis': cost_basis,
+                'total': total,
+                'position_count': position_count,
+            }
+        except Exception as e:
+            print(f"  ⚠️ Polymarket portfolio fetch error: {e}")
+            return None
+    
     @staticmethod
     def _ticker_event_stem(ticker: str) -> Optional[str]:
         """Extract the event stem from a Kalshi ticker.
@@ -1508,11 +2008,11 @@ class PaperTrader:
         return parts[0] if len(parts) == 2 else None
     
     def _find_position_for_game(self, game_id: str, odds: Optional[dict]) -> Optional[str]:
-        """Find position key for a game, handling both game_id and kalshi: prefix keys.
+        """Find position key for a game, handling game_id, kalshi:, and poly: prefix keys.
         
-        In live mode, positions might be keyed by 'kalshi:TICKER' if game_id wasn't found
-        at startup. This method also checks for ticker matches AND event stem matches,
-        and migrates keys if found.
+        In live mode, positions might be keyed by 'kalshi:TICKER' or 'poly:SLUG' if game_id 
+        wasn't found at startup. This method checks for ticker matches, event stem matches,
+        AND Polymarket slug matches, and migrates keys if found.
         
         Returns the key in open_positions, or None if no position exists.
         """
@@ -1534,7 +2034,12 @@ class PaperTrader:
                 if stem:
                     game_stems.add(stem)
         
-        # Check all positions for ticker or event stem match
+        # Get Polymarket slug for this game (if available)
+        game_poly_slug = None
+        if odds:
+            game_poly_slug = odds.get('poly_slug') or odds.get('slug')
+        
+        # Check all positions for ticker, event stem, or slug match
         for pos_key in list(self.open_positions.keys()):
             pos = self.open_positions[pos_key]
             pos_ticker = pos.get('market_ticker')
@@ -1544,15 +2049,23 @@ class PaperTrader:
             
             matched = False
             
-            # Exact ticker match
+            # Exact ticker match (Kalshi)
             if odds and (pos_ticker == odds.get('home_ticker') or pos_ticker == odds.get('away_ticker')):
                 matched = True
             
-            # Event stem match (catches home_no vs away_yes on same event)
+            # Event stem match (catches home_no vs away_yes on same Kalshi event)
             if not matched and game_stems:
                 pos_stem = self._ticker_event_stem(pos_ticker)
                 if pos_stem and pos_stem in game_stems:
                     matched = True
+            
+            # Polymarket slug match (for poly: prefixed keys or slug-based market_ticker)
+            if not matched and game_poly_slug and pos_ticker == game_poly_slug:
+                matched = True
+            
+            # Also check poly: prefix keys against slug
+            if not matched and game_poly_slug and pos_key == f"poly:{game_poly_slug}":
+                matched = True
             
             if matched:
                 if pos_key != game_id:
@@ -1641,6 +2154,85 @@ class PaperTrader:
     
     # NOTE: _reconcile_kalshi_positions removed - in live mode, Kalshi IS the source of truth
     # No reconciliation needed since we build positions directly from Kalshi API
+    
+    def _reconcile_positions(self):
+        """Periodic reconciliation: compare tracked open_positions against live API state.
+        
+        Called every ~60 cycles (~1 minute). Detects and corrects:
+        - Phantom positions (tracked but not on venue)
+        - Orphan positions (on venue but not tracked)
+        - Count drift (tracked count != actual count)
+        
+        Uses cached positions from this cycle to avoid extra API calls.
+        """
+        if not self.live_mode:
+            return
+        
+        drift_found = False
+        
+        # --- Kalshi reconciliation ---
+        if self.kalshi_client and self._cached_kalshi_positions is not None:
+            kalshi_tickers_held = set()
+            for ticker, pos in self._cached_kalshi_positions.items():
+                if pos.yes_count != 0:
+                    kalshi_tickers_held.add(ticker)
+            
+            for game_id, pos in list(self.open_positions.items()):
+                if pos.get('market_source') != 'Kalshi':
+                    continue
+                ticker = pos.get('market_ticker')
+                if not ticker:
+                    continue
+                
+                if ticker not in kalshi_tickers_held:
+                    # Check sibling tickers (same event stem)
+                    stem = self._ticker_event_stem(ticker) if ticker else None
+                    found_sibling = False
+                    if stem:
+                        for k_ticker in kalshi_tickers_held:
+                            if self._ticker_event_stem(k_ticker) == stem:
+                                found_sibling = True
+                                break
+                    
+                    if not found_sibling:
+                        print(f"  🔄 RECONCILE: Removing phantom Kalshi position {game_id} (not on Kalshi API)")
+                        self.open_positions.pop(game_id, None)
+                        drift_found = True
+                else:
+                    # Check count drift
+                    actual_count = abs(self._cached_kalshi_positions[ticker].yes_count)
+                    tracked_count = pos.get('live_fill_count', 0)
+                    if actual_count != tracked_count and tracked_count > 0:
+                        print(f"  🔄 RECONCILE: Kalshi count drift on {game_id}: tracked={tracked_count}, actual={actual_count}")
+                        pos['live_fill_count'] = actual_count
+                        drift_found = True
+        
+        # --- Polymarket reconciliation ---
+        if self.poly_client and self._cached_poly_positions is not None:
+            poly_slugs_held = set(self._cached_poly_positions.keys())
+            
+            for game_id, pos in list(self.open_positions.items()):
+                if pos.get('market_source') != 'Polymarket':
+                    continue
+                slug = pos.get('market_ticker')
+                if not slug:
+                    continue
+                
+                if slug not in poly_slugs_held:
+                    print(f"  🔄 RECONCILE: Removing phantom Poly position {game_id} (not on Polymarket API)")
+                    self.open_positions.pop(game_id, None)
+                    drift_found = True
+                else:
+                    # Check count drift
+                    actual_count = self._cached_poly_positions[slug]['quantity']
+                    tracked_count = pos.get('live_fill_count', 0)
+                    if actual_count != tracked_count and tracked_count > 0:
+                        print(f"  🔄 RECONCILE: Poly count drift on {game_id}: tracked={tracked_count}, actual={actual_count}")
+                        pos['live_fill_count'] = actual_count
+                        drift_found = True
+        
+        if drift_found:
+            print(f"  🔄 Reconciliation complete — drift corrected")
 
     def _load_realized_pnl(self):
         """Restore realized P/L and trade count from today's completed trades.
@@ -1774,6 +2366,87 @@ class PaperTrader:
         
         return 0
     
+    def _match_polymarket_odds(self, espn_home: str, espn_away: str) -> Optional[dict]:
+        """Match ESPN team names to Polymarket odds, returning in Kalshi-compatible format.
+        
+        Polymarket titles are "Away vs. Home" with outcome=away team.
+        Returns dict with home_yes_bid/ask, away_yes_bid/ask (in cents) + slug.
+        """
+        espn_home_norm = normalize_team_name(espn_home)
+        espn_away_norm = normalize_team_name(espn_away)
+        
+        best_match = None
+        best_score = 0
+        best_orientation = None  # 'team0_is_home' or 'team1_is_home'
+        
+        checked_titles = set()
+        
+        for poly_key, odds in self.polymarket_odds.items():
+            title = odds['title']
+            if title in checked_titles:
+                continue
+            checked_titles.add(title)
+            
+            # poly_away = first team in title (outcome team), poly_home = second
+            t0_norm = odds['poly_away_norm']  # outcome team
+            t1_norm = odds['poly_home_norm']
+            
+            # Check if poly_away = ESPN away AND poly_home = ESPN home
+            t0_away_score = self._name_match_score(espn_away_norm, t0_norm)
+            t1_home_score = self._name_match_score(espn_home_norm, t1_norm)
+            orientation1_total = t0_away_score + t1_home_score
+            
+            # Check if poly_away = ESPN home AND poly_home = ESPN away (flipped)
+            t0_home_score = self._name_match_score(espn_home_norm, t0_norm)
+            t1_away_score = self._name_match_score(espn_away_norm, t1_norm)
+            orientation2_total = t0_home_score + t1_away_score
+            
+            if orientation1_total > best_score and t0_away_score > 0 and t1_home_score > 0:
+                best_score = orientation1_total
+                best_match = odds
+                best_orientation = 'normal'  # poly_away=espn_away, poly_home=espn_home
+            
+            if orientation2_total > best_score and t0_home_score > 0 and t1_away_score > 0:
+                best_score = orientation2_total
+                best_match = odds
+                best_orientation = 'flipped'  # poly_away=espn_home, poly_home=espn_away
+        
+        if best_match and best_score >= 1.5:
+            if best_orientation == 'normal':
+                # Poly away = ESPN away, Poly home = ESPN home → prices already correct
+                return {
+                    'home_yes_bid': best_match['home_yes_bid'],
+                    'home_yes_ask': best_match['home_yes_ask'],
+                    'away_yes_bid': best_match['away_yes_bid'],
+                    'away_yes_ask': best_match['away_yes_ask'],
+                    'home_no_bid': None, 'home_no_ask': None,
+                    'away_no_bid': None, 'away_no_ask': None,
+                    'home_ticker': None, 'away_ticker': None,
+                    'home_prob': best_match['home_prob'],
+                    'away_prob': best_match['away_prob'],
+                    'title': best_match['title'],
+                    'slug': best_match['slug'],
+                    'source': 'Polymarket'
+                }
+            else:
+                # Poly away = ESPN home → swap prices
+                return {
+                    'home_yes_bid': best_match['away_yes_bid'],
+                    'home_yes_ask': best_match['away_yes_ask'],
+                    'away_yes_bid': best_match['home_yes_bid'],
+                    'away_yes_ask': best_match['home_yes_ask'],
+                    'home_no_bid': None, 'home_no_ask': None,
+                    'away_no_bid': None, 'away_no_ask': None,
+                    'home_ticker': None, 'away_ticker': None,
+                    'home_prob': best_match['away_prob'],
+                    'away_prob': best_match['home_prob'],
+                    'title': best_match['title'],
+                    'slug': best_match['slug'],
+                    'source': 'Polymarket'
+                }
+        
+        return None
+    
     def _get_kalshi_portfolio(self) -> dict:
         """Get current Kalshi portfolio state for display.
         
@@ -1853,18 +2526,62 @@ class PaperTrader:
         if tickers:
             self.ws_book.subscribe(tickers)
     
-    def _get_best_market_odds(self, espn_home: str, espn_away: str) -> Optional[dict]:
-        """Get Kalshi odds for a game, preferring WebSocket data over REST.
+    def _poly_ws_subscribe(self, slug: str):
+        """Subscribe to Polymarket WebSocket BBO updates for a market slug"""
+        if not self.use_poly_ws or not self.poly_ws_book or not slug:
+            return
         
-        Returns Kalshi odds dict with market_source set to 'Kalshi'.
+        if slug not in self._poly_ws_subscribed_slugs:
+            self._poly_ws_subscribed_slugs.add(slug)
+            self.poly_ws_book.subscribe([slug])
+    
+    def _get_best_market_odds(self, espn_home: str, espn_away: str) -> Optional[dict]:
+        """Get odds from both Kalshi and Polymarket, returning merged dict.
+        
+        Kalshi is always the primary dict (it has YES/NO + tickers).
+        Polymarket data is tagged on as poly_home_bid/ask etc + has_polymarket flag.
+        If Kalshi not available but Poly is, returns Poly-only dict.
         """
         kalshi = self._match_kalshi_odds(espn_home, espn_away)
+        poly = self._match_polymarket_odds(espn_home, espn_away)
         
-        if not kalshi:
+        if not kalshi and not poly:
             return None
         
+        if not kalshi:
+            # Polymarket only — use as primary
+            poly['market_source'] = 'Polymarket'
+            poly['data_source'] = 'rest'
+            poly['ws_age_ms'] = None
+            poly['has_polymarket'] = True
+            poly['poly_home_bid'] = poly['home_yes_bid']
+            poly['poly_home_ask'] = poly['home_yes_ask']
+            poly['poly_away_bid'] = poly['away_yes_bid']
+            poly['poly_away_ask'] = poly['away_yes_ask']
+            poly['poly_slug'] = poly.get('slug')
+            
+            # Override with WS if available
+            slug = poly.get('slug')
+            if slug and self.use_poly_ws and self.poly_ws_book:
+                self._poly_ws_subscribe(slug)
+                ws_prices = self.poly_ws_book.get_prices(slug)
+                if ws_prices and ws_prices.get('away_bid') is not None:
+                    poly['home_yes_bid'] = ws_prices['home_bid']
+                    poly['home_yes_ask'] = ws_prices['home_ask']
+                    poly['away_yes_bid'] = ws_prices['away_bid']
+                    poly['away_yes_ask'] = ws_prices['away_ask']
+                    poly['poly_home_bid'] = ws_prices['home_bid']
+                    poly['poly_home_ask'] = ws_prices['home_ask']
+                    poly['poly_away_bid'] = ws_prices['away_bid']
+                    poly['poly_away_ask'] = ws_prices['away_ask']
+                    poly['data_source'] = 'websocket'
+                    poly['ws_age_ms'] = ws_prices['age_ms']
+            
+            return poly
+        
+        # Kalshi is primary
         kalshi['market_source'] = 'Kalshi'
-        kalshi['data_source'] = 'rest'  # Default to REST
+        kalshi['data_source'] = 'rest'
         kalshi['ws_age_ms'] = None
         
         # If WebSocket is available, try to get fresher prices
@@ -1899,6 +2616,33 @@ class PaperTrader:
                         kalshi['ws_age_ms'] = away_ws['age_ms']
                     else:
                         kalshi['ws_age_ms'] = max(kalshi['ws_age_ms'], away_ws['age_ms'])
+        
+        # Tag Polymarket data onto Kalshi dict for dual-venue evaluation
+        if poly:
+            kalshi['has_polymarket'] = True
+            kalshi['poly_home_bid'] = poly['home_yes_bid']
+            kalshi['poly_home_ask'] = poly['home_yes_ask']
+            kalshi['poly_away_bid'] = poly['away_yes_bid']
+            kalshi['poly_away_ask'] = poly['away_yes_ask']
+            kalshi['poly_slug'] = poly.get('slug')
+            
+            # If Polymarket WS available, override REST with fresher prices
+            slug = poly.get('slug')
+            if slug and self.use_poly_ws and self.poly_ws_book:
+                self._poly_ws_subscribe(slug)
+                ws_prices = self.poly_ws_book.get_prices(slug)
+                if ws_prices and ws_prices.get('away_bid') is not None:
+                    kalshi['poly_away_bid'] = ws_prices['away_bid']
+                    kalshi['poly_away_ask'] = ws_prices['away_ask']
+                    kalshi['poly_home_bid'] = ws_prices['home_bid']
+                    kalshi['poly_home_ask'] = ws_prices['home_ask']
+                    kalshi['poly_data_source'] = 'websocket'
+                    kalshi['poly_ws_age_ms'] = ws_prices['age_ms']
+                else:
+                    kalshi['poly_data_source'] = 'rest'
+                    kalshi['poly_ws_age_ms'] = None
+        else:
+            kalshi['has_polymarket'] = False
         
         return kalshi
     
@@ -1970,8 +2714,11 @@ class PaperTrader:
                         if home_score != prev_home or away_score != prev_away:
                             self.last_score_change_time[game_id] = now
                     else:
-                        # First time seeing this game - treat scores as fresh
-                        self.last_score_change_time[game_id] = now
+                        # First time seeing this game — do NOT mark as fresh.
+                        # In live mode, we must observe an actual score change before
+                        # trusting data (prevents stale-data entries on restart).
+                        # last_score_change_time stays unset → score_age will be large.
+                        pass
                     
                     # Track ESPN data freshness - did the game state actually change?
                     current_state = (home_score, away_score, time_remaining)
@@ -1993,7 +2740,8 @@ class PaperTrader:
                     self.previous_scores[game_id] = (home_score, away_score)
                     
                     # Add score freshness info for adverse selection guard
-                    game['seconds_since_score_change'] = now - self.last_score_change_time.get(game_id, now)
+                    # Default to 0 (epoch) if no score change seen yet → score_age will be huge → blocks entry
+                    game['seconds_since_score_change'] = now - self.last_score_change_time.get(game_id, 0)
                     
                     games.append(game)
             except Exception as e:
@@ -2049,6 +2797,20 @@ class PaperTrader:
         # Add predictions if we have them
         pred = self.predictions.get(game_id)
         if pred:
+            # Verify team alignment — ESPN and predictions may disagree
+            # on home/away for neutral site games. If so, flip ESPN to match.
+            if pred['team_a_home'] == 1:
+                pred_home_id = pred['team_a_id']
+            else:
+                pred_home_id = pred['team_b_id']
+            
+            if game['home_team_id'] != pred_home_id:
+                # ESPN has teams flipped vs predictions — swap everything
+                game['home_team'], game['away_team'] = game['away_team'], game['home_team']
+                game['home_team_id'], game['away_team_id'] = game['away_team_id'], game['home_team_id']
+                game['home_score'], game['away_score'] = game['away_score'], game['home_score']
+                home_score, away_score = game['home_score'], game['away_score']
+            
             game['pregame_home_prob'] = pred['pregame_home_prob']
             
             if state == 'in':
@@ -2088,6 +2850,16 @@ class PaperTrader:
         kalshi_away_edge = None
         home_edge = None  # Legacy
         away_edge = None  # Legacy
+        
+        # Polymarket prices
+        poly_home_bid = None
+        poly_home_ask = None
+        poly_away_bid = None
+        poly_away_ask = None
+        poly_home_edge = None
+        poly_away_edge = None
+        poly_slug = None
+        chosen_venue = None
         
         # Get model probability
         our_home = game.get('live_home_prob') or game.get('pregame_home_prob')
@@ -2139,6 +2911,30 @@ class PaperTrader:
                     home_edge = our_home - (home_yes_ask / 100.0)
                 if away_yes_ask:
                     away_edge = (1 - our_home) - (away_yes_ask / 100.0)
+            
+            # Polymarket prices (tagged onto odds dict by _get_best_market_odds)
+            if kalshi_odds.get('has_polymarket'):
+                poly_home_bid = kalshi_odds.get('poly_home_bid')
+                poly_home_ask = kalshi_odds.get('poly_home_ask')
+                poly_away_bid = kalshi_odds.get('poly_away_bid')
+                poly_away_ask = kalshi_odds.get('poly_away_ask')
+                poly_slug = kalshi_odds.get('poly_slug')
+                
+                if our_home:
+                    if poly_home_ask:
+                        poly_home_edge = our_home - (poly_home_ask / 100.0)
+                    if poly_away_ask:
+                        poly_away_edge = (1 - our_home) - (poly_away_ask / 100.0)
+            
+            # Determine which venue has best entry for snapshot logging
+            if our_home and best_home_ask and poly_home_ask:
+                k_best = min(best_home_ask, best_away_ask) if best_away_ask else best_home_ask
+                p_best = min(poly_home_ask, poly_away_ask) if poly_away_ask else poly_home_ask
+                chosen_venue = 'Polymarket' if p_best < k_best else 'Kalshi'
+            elif poly_home_ask and not best_home_ask:
+                chosen_venue = 'Polymarket'
+            elif best_home_ask:
+                chosen_venue = 'Kalshi'
         
         cursor.execute("""
             INSERT INTO live_snapshots 
@@ -2149,8 +2945,11 @@ class PaperTrader:
              home_no_bid, home_no_ask, away_no_bid, away_no_ask,
              best_home_ask, best_home_bid, best_away_ask, best_away_bid,
              kalshi_home_edge, kalshi_away_edge,
-             home_edge, away_edge)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             home_edge, away_edge,
+             poly_home_bid, poly_home_ask, poly_away_bid, poly_away_ask,
+             poly_home_edge, poly_away_edge,
+             poly_slug, chosen_venue)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             datetime.now().isoformat(),
             game['game_id'],
@@ -2182,7 +2981,15 @@ class PaperTrader:
             kalshi_home_edge,
             kalshi_away_edge,
             home_edge,
-            away_edge
+            away_edge,
+            poly_home_bid,
+            poly_home_ask,
+            poly_away_bid,
+            poly_away_ask,
+            poly_home_edge,
+            poly_away_edge,
+            poly_slug,
+            chosen_venue
         ))
         if commit:
             self.conn.commit()
@@ -2218,6 +3025,25 @@ class PaperTrader:
                 
                 if kalshi_age_ms > MAX_KALSHI_STALE_MS:
                     return None  # Kalshi data too stale, skip
+        
+        # === POLYMARKET DATA FRESHNESS GUARD ===
+        # Same posture as Kalshi: if WS is active, require recent Poly data before trading Poly
+        if self.poly_ws_book and kalshi_odds and status == 'in' and kalshi_odds.get('has_polymarket'):
+            poly_age_ms = kalshi_odds.get('poly_ws_age_ms')
+            
+            if poly_age_ms is not None:
+                if time_remaining > 480:
+                    MAX_POLY_STALE_MS = 10000  # 10 seconds (Poly WS can be slower)
+                else:
+                    MAX_POLY_STALE_MS = 6000  # 6 seconds late game
+                
+                if poly_age_ms > MAX_POLY_STALE_MS:
+                    # Poly data stale — only block Poly venue, not Kalshi
+                    # We handle this by nullifying Poly prices so evaluate_venue skips it
+                    kalshi_odds['poly_home_bid'] = None
+                    kalshi_odds['poly_home_ask'] = None
+                    kalshi_odds['poly_away_bid'] = None
+                    kalshi_odds['poly_away_ask'] = None
         
         # === ESPN SCORE FRESHNESS GUARD ===
         # Only enter when ESPN score data is recently updated.
@@ -2377,11 +3203,68 @@ class PaperTrader:
             
             return best
         
-        # Determine the primary venue (always Kalshi now)
-        primary_venue = 'Kalshi'
+        # === DUAL-VENUE EVALUATION: Pick best net edge after fees ===
+        is_kalshi_primary = kalshi_odds.get('market_source') != 'Polymarket'
         
-        # Evaluate Kalshi - pass full odds dict
-        best = evaluate_venue(kalshi_odds, primary_venue)
+        # Evaluate Kalshi (skip if venue is polymarket-only)
+        kalshi_best = None
+        if self.venue in ('kalshi', 'best') and is_kalshi_primary:
+            kalshi_best = evaluate_venue(kalshi_odds, 'Kalshi')
+        
+        # Evaluate Polymarket (skip if venue is kalshi-only)
+        poly_best = None
+        if self.venue in ('polymarket', 'best'):
+            if kalshi_odds.get('has_polymarket'):
+                poly_odds = {
+                    'home_yes_bid': kalshi_odds.get('poly_home_bid'),
+                    'home_yes_ask': kalshi_odds.get('poly_home_ask'),
+                    'away_yes_bid': kalshi_odds.get('poly_away_bid'),
+                    'away_yes_ask': kalshi_odds.get('poly_away_ask'),
+                    'home_no_bid': None, 'home_no_ask': None,
+                    'away_no_bid': None, 'away_no_ask': None,
+                    'home_ticker': None, 'away_ticker': None,
+                }
+                poly_best = evaluate_venue(poly_odds, 'Polymarket')
+            elif not is_kalshi_primary:
+                # Poly-only match (no Kalshi) — evaluate from primary dict
+                poly_best = evaluate_venue(kalshi_odds, 'Polymarket')
+        
+        # Pick the venue with better net EV after fees
+        best = None
+        if kalshi_best and poly_best:
+            k_side, k_edge, k_price, k_spread = kalshi_best[0], kalshi_best[1], kalshi_best[2], kalshi_best[3]
+            p_side, p_edge, p_price, p_spread = poly_best[0], poly_best[1], poly_best[2], poly_best[3]
+            k_prob = our_home if k_side == 'home' else 1 - our_home
+            p_prob = our_home if p_side == 'home' else 1 - our_home
+            k_net_ev = calculate_net_ev(k_prob, k_price, k_spread, 'Kalshi')
+            p_net_ev = calculate_net_ev(p_prob, p_price, p_spread, 'Polymarket')
+            
+            # Log venue comparison
+            k_ct = kalshi_best[6]
+            p_ct = poly_best[6]
+            winner = "POLY" if p_net_ev > k_net_ev else "KALSHI"
+            away_short = strip_mascot(game.get('away_team', ''))[:12]
+            home_short = strip_mascot(game.get('home_team', ''))[:12]
+            print(f"  🔀 VENUE: {away_short}@{home_short} | K:{k_ct} {k_price*100:.0f}¢ spd={k_spread:.0f} ev={k_net_ev:.2f} | P:{p_ct} {p_price*100:.0f}¢ spd={p_spread:.0f} ev={p_net_ev:.2f} → {winner}")
+            
+            if p_net_ev > k_net_ev:
+                best = poly_best
+                best = (best[0], best[1], best[2], best[3], kalshi_odds.get('poly_slug'), 'Polymarket', best[6])
+            else:
+                best = kalshi_best
+        elif kalshi_best:
+            best = kalshi_best
+            away_short = strip_mascot(game.get('away_team', ''))[:12]
+            home_short = strip_mascot(game.get('home_team', ''))[:12]
+            has_poly = kalshi_odds.get('has_polymarket', False)
+            print(f"  🔀 VENUE: {away_short}@{home_short} | K-only ({kalshi_best[6]} {kalshi_best[2]*100:.0f}¢) | Poly={'no match' if not has_poly else 'no edge'}")
+        elif poly_best:
+            best = poly_best
+            slug = kalshi_odds.get('poly_slug') or kalshi_odds.get('slug')
+            best = (best[0], best[1], best[2], best[3], slug, 'Polymarket', best[6])
+            away_short = strip_mascot(game.get('away_team', ''))[:12]
+            home_short = strip_mascot(game.get('home_team', ''))[:12]
+            print(f"  🔀 VENUE: {away_short}@{home_short} | P-only ({poly_best[6]} {poly_best[2]*100:.0f}¢) | Kalshi={'no match' if not is_kalshi_primary else 'no edge'}")
         
         if not best:
             # No opportunity - clear any pending confirmation for this game
@@ -2391,6 +3274,15 @@ class PaperTrader:
         
         best_side, best_edge, best_entry_price, best_spread, market_ticker, market_source, contract_type = best
         our_prob = our_home if best_side == 'home' else 1 - our_home
+        
+        # === CROSS-VENUE DUPLICATE GUARD ===
+        # Prevent placing a trade on Poly if same game already has Kalshi exposure, and vice versa.
+        # Unless the position is already on the same venue (top-up case handled in _handle_entry).
+        if game_id in self.open_positions:
+            existing_venue = self.open_positions[game_id].get('market_source', 'Kalshi')
+            if existing_venue != market_source:
+                # Same game, different venue — block to avoid cross-venue duplication
+                return None
         
         # === TWO-TICK CONFIRMATION ===
         # Only needed when using REST (stale data). WebSocket provides real-time prices.
@@ -2550,16 +3442,30 @@ class PaperTrader:
         if score_age > self.MAX_ESPN_SCORE_STALE_SEC:
             return None  # Wait for fresh ESPN data before deciding to exit
         
-        # Get current BID based on contract_type
-        bid_map = {
-            'home_yes': 'home_yes_bid',
-            'home_no': 'home_no_bid',
-            'away_yes': 'away_yes_bid',
-            'away_no': 'away_no_bid'
-        }
-        
-        bid_key = bid_map.get(contract_type, f'{side}_yes_bid')
-        current_bid_cents = kalshi_odds.get(bid_key, 0)
+        # Get current BID based on contract_type and venue
+        if market_source == 'Polymarket':
+            # Use Polymarket bids (poly_home_bid / poly_away_bid)
+            poly_bid_map = {
+                'home_yes': 'poly_home_bid',
+                'away_yes': 'poly_away_bid',
+            }
+            bid_key = poly_bid_map.get(contract_type)
+            if not bid_key:
+                return None  # No NO contracts on Polymarket
+            current_bid_cents = kalshi_odds.get(bid_key, 0)
+            # If no poly_ fields (Poly-only dict), fall back to standard keys
+            if not current_bid_cents:
+                bid_key = f'{side}_yes_bid'
+                current_bid_cents = kalshi_odds.get(bid_key, 0)
+        else:
+            bid_map = {
+                'home_yes': 'home_yes_bid',
+                'home_no': 'home_no_bid',
+                'away_yes': 'away_yes_bid',
+                'away_no': 'away_no_bid'
+            }
+            bid_key = bid_map.get(contract_type, f'{side}_yes_bid')
+            current_bid_cents = kalshi_odds.get(bid_key, 0)
         
         if not current_bid_cents or current_bid_cents <= 0:
             return None
@@ -2578,7 +3484,7 @@ class PaperTrader:
         
         # EV_exit = current_bid - exit_fee - slippage
         bid_decimal = current_bid_cents / 100.0
-        exit_fee = kalshi_fee_cents(bid_decimal)
+        exit_fee = poly_fee_cents(bid_decimal) if market_source == 'Polymarket' else kalshi_fee_cents(bid_decimal)
         ev_exit = current_bid_cents - exit_fee - self.EV_EXIT_SLIPPAGE_CENTS
         
         exit_reason = None
@@ -2619,10 +3525,11 @@ class PaperTrader:
         # === LIVE TRADING: Sell position FIRST ===
         is_settlement = 'SETTLEMENT' in exit_info['exit_reason'] or exit_info['exit_price'] in [0.0, 1.0]
         live_fill_count = position.get('live_fill_count', 0)
+        market_source = position.get('market_source', 'Kalshi')
         
         # If live_fill_count not tracked (e.g., after restart), get from Kalshi
         ticker = position.get('market_ticker')
-        if live_fill_count == 0 and self.live_mode and self.kalshi_client and ticker:
+        if live_fill_count == 0 and self.live_mode and self.kalshi_client and ticker and market_source == 'Kalshi':
             try:
                 kalshi_positions = self.kalshi_client.get_positions()
                 if ticker in kalshi_positions:
@@ -2630,7 +3537,7 @@ class PaperTrader:
             except Exception as e:
                 print(f"  ⚠️ Could not get Kalshi position count: {e}")
         
-        if self.live_mode and self.kalshi_client and live_fill_count > 0 and not is_settlement:
+        if self.live_mode and self.kalshi_client and live_fill_count > 0 and not is_settlement and market_source == 'Kalshi':
             # Only sell if we have a live position and it's not a settlement (settlements auto-settle)
             ticker = position.get('market_ticker')
             if ticker:
@@ -2787,6 +3694,127 @@ class PaperTrader:
                     print(f"  ⚠️ SELL ERROR: {e} - keeping position tracked")
                     return  # Don't remove position if sell errored
         
+        # === LIVE TRADING: Polymarket sell ===
+        if self.live_mode and self.poly_client and live_fill_count > 0 and not is_settlement and market_source == 'Polymarket':
+            slug = position.get('market_ticker')  # For Poly, market_ticker holds the slug
+            if slug:
+                contract_type = position.get('contract_type', f'{side}_yes')
+                
+                # === PRE-SELL SAFETY CHECK: Verify we actually hold this position ===
+                try:
+                    poly_positions = self._get_poly_positions()
+                    if poly_positions is None:
+                        print(f"  🛡️ Could not verify Poly position — BLOCKING sell for safety")
+                        return
+                    
+                    if slug not in poly_positions or poly_positions[slug]['quantity'] == 0:
+                        print(f"  ⚠️ NO POSITION on Polymarket for {slug} — removing from tracking")
+                        self.open_positions.pop(game_id, None)
+                        self.just_exited.add(game_id)
+                        cooldown_key = (game_id, side)
+                        self.exit_cooldowns[cooldown_key] = (exit_info.get('time_remaining_sec', 0), self.COOLDOWN_AFTER_EXIT, "Position already closed on Polymarket")
+                        return
+                    
+                    # Use actual count from API
+                    actual_qty = poly_positions[slug]['quantity']
+                    if actual_qty != live_fill_count:
+                        print(f"  ℹ️ Poly position count drift: tracked={live_fill_count}, actual={actual_qty}")
+                        live_fill_count = actual_qty
+                        position['live_fill_count'] = actual_qty
+                        
+                except Exception as e:
+                    print(f"  🛡️ Could not verify Poly position: {e} — BLOCKING sell for safety")
+                    return
+                
+                # Map to sell intent (opposite of entry)
+                if 'away' in contract_type:
+                    sell_intent = 'ORDER_INTENT_SELL_LONG'
+                else:
+                    sell_intent = 'ORDER_INTENT_SELL_SHORT'
+                
+                EXIT_PRICE_BUFFER_CENTS = 3
+                home_exit_cents = exit_info['exit_price'] * 100
+                
+                if 'away' in contract_type:
+                    # SELL_LONG: selling away token, price = sell floor, lower = more aggressive
+                    raw_price_cents = home_exit_cents
+                    price_cents = max(1, raw_price_cents - EXIT_PRICE_BUFFER_CENTS)
+                else:
+                    # SELL_SHORT: SDK sends BUY on away token to close short
+                    # Complement price: home bid 60¢ → buy away at 40¢ ceiling
+                    # Higher ceiling = more aggressive for buys
+                    raw_price_cents = 100 - home_exit_cents
+                    price_cents = min(99, raw_price_cents + EXIT_PRICE_BUFFER_CENTS)
+                
+                price_decimal = price_cents / 100.0
+                
+                print(f"\n  🟣 POLY SELL: {slug} {sell_intent} @ {price_cents:.1f}¢ (home_bid={home_exit_cents:.1f}¢) x {live_fill_count}")
+                
+                try:
+                    result = self.poly_client.orders.create({
+                        "marketSlug": slug,
+                        "intent": sell_intent,
+                        "type": "ORDER_TYPE_LIMIT",
+                        "price": {"value": f"{price_cents / 100:.4f}", "currency": "USD"},
+                        "quantity": live_fill_count,
+                        "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+                    })
+                    
+                    fills = result.get('executions', []) or result.get('fills', [])
+                    fill_count = sum(int(float(f.get('quantity', 0))) if isinstance(f.get('quantity', 0), str) else f.get('quantity', 0) for f in fills)
+                    
+                    if fill_count > 0:
+                        # Exit price in home-probability terms from our known limit.
+                        # Same logic as entry: IOC fills at limit, avoid SDK ambiguity.
+                        if sell_intent == 'ORDER_INTENT_SELL_SHORT':
+                            # We sent BUY away @ price_cents. Home equiv = complement.
+                            avg_exit = 1.0 - (price_cents / 100.0)
+                        else:
+                            avg_exit = price_cents / 100.0
+                        
+                        # Fees on raw CLOB price
+                        fee_cents = poly_fee_cents(price_cents / 100.0) * fill_count
+                        
+                        exit_info['exit_price'] = avg_exit
+                        print(f"  ✓ SOLD {fill_count} @ {avg_exit*100:.0f}¢ (fees: ~{fee_cents:.2f}¢)")
+                        
+                        # === POST-TRADE VERIFICATION ===
+                        verified_qty = self._verify_poly_position(slug, -fill_count, action='sell')
+                        if verified_qty is not None and verified_qty > 0:
+                            remaining = verified_qty
+                            print(f"  ⚠️ PARTIAL EXIT: {remaining} contracts still on Polymarket")
+                            position['live_fill_count'] = remaining
+                            return  # Stay open, retry next cycle
+                        elif verified_qty == 0:
+                            print(f"  ✓ VERIFIED: Position fully closed on Polymarket")
+                        
+                        if fill_count < live_fill_count:
+                            remaining = live_fill_count - fill_count
+                            print(f"  ⚠️ PARTIAL FILL: Sold {fill_count}, {remaining} remaining")
+                            position['live_fill_count'] = remaining
+                            return  # Retry next cycle
+                    else:
+                        # SDK may report 0 fills even when order executed — verify via positions API
+                        import time
+                        time.sleep(0.5)
+                        verify_positions = self._get_poly_positions()
+                        if verify_positions is not None and (slug not in verify_positions or verify_positions[slug]['quantity'] == 0):
+                            print(f"  ✓ VERIFIED: Position closed on Polymarket (SDK reported 0 fills but position gone)")
+                            # Use the limit price as exit price since we can't get actual fill price
+                            if sell_intent == 'ORDER_INTENT_SELL_SHORT':
+                                avg_exit = 1.0 - (price_cents / 100.0)
+                            else:
+                                avg_exit = price_cents / 100.0
+                            fee_cents = poly_fee_cents(price_cents / 100.0) * live_fill_count
+                            exit_info['exit_price'] = avg_exit
+                            print(f"  ✓ SOLD {live_fill_count} @ ~{avg_exit*100:.0f}¢ (fees: ~{fee_cents:.2f}¢)")
+                        else:
+                            print(f"  ⚠️ POLY SELL NOT FILLED - keeping position tracked")
+                            return
+                except Exception as e:
+                    print(f"  ⚠️ POLY SELL ERROR: {e} - keeping position tracked")
+                    return
+        
         # Only remove position after successful exit (or settlement)
         self.open_positions.pop(game_id, None)
         
@@ -2807,9 +3835,17 @@ class PaperTrader:
         
         gross_pnl_cents = (exit_price - entry_price) * 100
         
-        # Calculate Kalshi fees (settlement = no exit fee)
-        entry_fee = kalshi_fee_cents(entry_price)
-        exit_fee = 0 if is_settlement else kalshi_fee_cents(exit_price)
+        # Calculate fees based on venue
+        if venue == 'Polymarket':
+            # SHORT positions store complemented home prices; fees are on raw CLOB (away) price
+            ct = position.get('contract_type', f'{side}_yes')
+            raw_entry = (1.0 - entry_price) if ct == 'home_yes' else entry_price
+            raw_exit = (1.0 - exit_price) if ct == 'home_yes' else exit_price
+            entry_fee = poly_fee_cents(raw_entry)
+            exit_fee = 0 if is_settlement else poly_fee_cents(raw_exit)
+        else:
+            entry_fee = kalshi_fee_cents(entry_price)
+            exit_fee = 0 if is_settlement else kalshi_fee_cents(exit_price)
         
         total_fees = entry_fee + exit_fee
         net_pnl_cents = gross_pnl_cents - total_fees
@@ -2867,35 +3903,89 @@ class PaperTrader:
     
     def run(self, poll_interval: int = 1):
         """Main trading loop"""
-        print("\n" + "═"*80)
-        print("  📈 KALSHI TRADER │ Live Market Trading")
-        print("═"*80)
+        _w = get_terminal_width()
+        _sw = min(_w - 2, 80)
+        print("\n" + "═"*_sw)
+        print("  📈 LIVE TRADER │ Dual-Venue Market Trading")
+        print("═"*_sw)
         print(f"  Entry: 5%→15% edge (exp k=2) │ Spread: 3¢/2¢")
         print(f"  Exit: EV-based (OV={self.OV_SCALE}×N^{self.OV_EXPONENT}) │ Cooldown: {self.COOLDOWN_AFTER_EXIT}s game-time")
         print(f"  Haircut: k={self.HAIRCUT_K} × H(t,|m|), ramp {self.HAIRCUT_RAMP_HI//60}:{self.HAIRCUT_RAMP_HI%60:02d}→{self.HAIRCUT_RAMP_LO//60}:{self.HAIRCUT_RAMP_LO%60:02d}, |m|≤{self.HAIRCUT_MARGIN_MAX}")
         ws_str = "WS" if KALSHI_WS_AVAILABLE else "REST"
-        print(f"  Data: {ws_str}")
+        poly_str = "WS" if self.use_poly_ws else ("REST" if self.poly_client else "✗")
+        print(f"  Data: Kalshi={ws_str} │ Polymarket={poly_str} │ Venue: {self.venue}")
         if self.live_mode:
             print(f"  Contracts: {self.live_contracts}")
-        print("═"*80 + "\n")
+        print("═"*_sw + "\n")
         
         try:
+            cycle_number = 0
+            RECONCILE_EVERY_N_CYCLES = 60  # ~1 minute at 1-second polling
+            
             while True:
                 cycle_start = time.time()
+                cycle_number += 1
                 
                 # Clear just_exited from previous tick
                 self.just_exited.clear()
                 
+                # === WS HEALTH CHECK: Connection-level freshness ===
+                WS_DEAD_SEC = 15  # No messages at all in 15s = connection dead
+                
+                if self.use_ws and self.ws_book:
+                    age = time.time() - self.ws_book.last_any_message_ts if self.ws_book.last_any_message_ts > 0 else float('inf')
+                    if age > WS_DEAD_SEC:
+                        print(f"  🔄 Kalshi WS dead — no messages for {age:.0f}s — forcing reconnect...")
+                        try:
+                            self.ws_book.stop()
+                            time.sleep(1)
+                            self.ws_book.start()
+                            time.sleep(1)
+                            if self.ws_book.connected:
+                                print("  ✓ Kalshi WS reconnected")
+                                self._ws_subscribed_tickers.clear()
+                            else:
+                                print("  ⚠️ Kalshi WS reconnect failed — will retry next cycle")
+                        except Exception as e:
+                            print(f"  ⚠️ Kalshi WS restart error: {e}")
+                
+                if self.use_poly_ws and self.poly_ws_book:
+                    age = time.time() - self.poly_ws_book.last_any_message_ts if self.poly_ws_book.last_any_message_ts > 0 else float('inf')
+                    if age > WS_DEAD_SEC:
+                        print(f"  🔄 Poly WS dead — no messages for {age:.0f}s — forcing reconnect...")
+                        try:
+                            self.poly_ws_book.stop()
+                            time.sleep(1)
+                            self.poly_ws_book.start()
+                            time.sleep(1)
+                            if self.poly_ws_book.connected:
+                                print("  ✓ Poly WS reconnected")
+                                self._poly_ws_subscribed_slugs.clear()
+                            else:
+                                print("  ⚠️ Poly WS reconnect failed — will retry next cycle")
+                        except Exception as e:
+                            print(f"  ⚠️ Poly WS restart error: {e}")
+                
                 # Fetch all data in PARALLEL for lower latency
                 kalshi_portfolio = None
-                with ThreadPoolExecutor(max_workers=3) as executor:
+                poly_portfolio = None
+                with ThreadPoolExecutor(max_workers=5) as executor:
                     futures = {
-                        executor.submit(self._load_kalshi_odds): 'kalshi',
                         executor.submit(self.scan_games): 'espn',
                     }
-                    # Add portfolio fetch for live mode
+                    # Kalshi: use REST if WS is dead, or every 10 min for new market discovery
+                    kalshi_ws_alive = self.use_ws and self.ws_book and self.ws_book.connected
+                    if not kalshi_ws_alive or cycle_number % 600 == 0:
+                        futures[executor.submit(self._load_kalshi_odds)] = 'kalshi'
+                    # Polymarket: use REST if WS is dead, or every 10 min for new market discovery
+                    poly_ws_alive = self.use_poly_ws and self.poly_ws_book and self.poly_ws_book.connected
+                    if self.poly_client and (not poly_ws_alive or cycle_number % 600 == 0):
+                        futures[executor.submit(self._load_polymarket_odds)] = 'polymarket'
+                    # Add portfolio fetches for live mode
                     if self.live_mode:
                         futures[executor.submit(self._get_kalshi_portfolio)] = 'portfolio'
+                        if self.poly_client:
+                            futures[executor.submit(self._get_polymarket_portfolio)] = 'poly_portfolio'
                     
                     games = []
                     for future in as_completed(futures):
@@ -2906,6 +3996,8 @@ class PaperTrader:
                                 games = result
                             elif name == 'portfolio':
                                 kalshi_portfolio = result
+                            elif name == 'poly_portfolio':
+                                poly_portfolio = result
                         except Exception as e:
                             print(f"  ⚠️ {name} fetch error: {e}")
                 
@@ -2920,6 +4012,18 @@ class PaperTrader:
                         self._cached_kalshi_positions = self.kalshi_client.get_positions()
                     except Exception as e:
                         print(f"  ⚠️ Failed to cache Kalshi positions: {e}")
+                
+                # Cache Polymarket positions once per cycle
+                self._cached_poly_positions = None
+                if self.live_mode and self.poly_client:
+                    try:
+                        self._cached_poly_positions = self._get_poly_positions()
+                    except Exception as e:
+                        print(f"  ⚠️ Failed to cache Poly positions: {e}")
+                
+                # Periodic reconciliation: correct drift between tracked and actual positions
+                if self.live_mode and cycle_number % RECONCILE_EVERY_N_CYCLES == 0:
+                    self._reconcile_positions()
                 
                 # Check for settlements on finished games
                 for game in finished_games:
@@ -2936,15 +4040,30 @@ class PaperTrader:
                 # Clear screen
                 print("\033[2J\033[H", end="")
                 
+                # Get responsive layout params
+                L = get_layout()
+                W = L['sep_width']
+                TW = L['team_width']
+                MW = L['matchup_width']
+                compact = L['compact']
+                
                 # Clean up cooldowns for finished games
                 active_game_ids = {g['game_id'] for g in live_games + upcoming_games}
                 expired = [key for key in self.exit_cooldowns.keys() if key[0] not in active_game_ids]
                 for key in expired:
                     del self.exit_cooldowns[key]
                 
-                # Helper to get bid for a contract type (Kalshi only)
+                # Helper to get bid for a contract type
                 def get_contract_bid(odds, contract_type, market_source):
-                    """Get the bid price for a specific Kalshi contract type"""
+                    """Get the bid price for a specific contract type on the given venue"""
+                    if market_source == 'Polymarket':
+                        poly_bid_map = {'home_yes': 'poly_home_bid', 'away_yes': 'poly_away_bid'}
+                        bid_key = poly_bid_map.get(contract_type)
+                        if bid_key and odds.get(bid_key):
+                            return odds[bid_key] / 100.0
+                        # Fallback: if Poly-only dict, standard keys have Poly prices
+                        bid_key = f'{contract_type.split("_")[0]}_yes_bid'
+                        return odds.get(bid_key, 0) / 100.0 if odds.get(bid_key) else 0
                     bid_map = {
                         'home_yes': 'home_yes_bid',
                         'home_no': 'home_no_bid',
@@ -2986,29 +4105,70 @@ class PaperTrader:
                             current_bid = get_contract_bid(kalshi, contract_type, market_source)
                             unrealized_pnl += (current_bid - pos['entry_price']) * 100
                 
-                # kalshi_portfolio already fetched in parallel above
+                # kalshi_portfolio and poly_portfolio already fetched in parallel above
                 
-                print(f"\n{'═'*120}")
+                print(f"\n{'═'*W}")
                 # Real ROI = profit / peak capital deployed
                 roi_pct = (self.realized_pnl / self.peak_capital_deployed * 100) if self.peak_capital_deployed > 0 else 0
                 kalshi_count = len(self.kalshi_odds) // 2
+                poly_count = len(self.polymarket_odds) // 2 if self.polymarket_odds else 0
                 
                 # Compact header with ROI
                 time_str = datetime.now().strftime('%H:%M:%S')
                 
                 if self.live_mode:
-                    # Show actual Kalshi portfolio data
                     ws_str = " │ WS" if self.use_ws else ""
+                    
+                    # Build venue-specific portfolio lines
+                    k_line = ""
+                    p_line = ""
+                    combined_total = 0.0
+                    combined_positions = 0
+                    
                     if kalshi_portfolio:
                         session_pnl = kalshi_portfolio['session_pnl']
                         pnl_str = f"+${session_pnl:.2f}" if session_pnl >= 0 else f"-${abs(session_pnl):.2f}"
-                        print(f"  🔴 LIVE │ {time_str} │ Portfolio: ${kalshi_portfolio['total']:.2f} │ Cash: ${kalshi_portfolio['cash']:.2f} │ Positions: ${kalshi_portfolio['position_value']:.2f} ({kalshi_portfolio['position_count']}) │ Session: {pnl_str}{ws_str}")
+                        if compact:
+                            k_line = f"K:${kalshi_portfolio['total']:.2f} ({pnl_str})"
+                        else:
+                            k_line = f"K: ${kalshi_portfolio['total']:.2f} (${kalshi_portfolio['cash']:.2f} cash + ${kalshi_portfolio['position_value']:.2f} pos×{kalshi_portfolio['position_count']}) {pnl_str}"
+                        combined_total += kalshi_portfolio['total']
+                        combined_positions += kalshi_portfolio['position_count']
+                    
+                    if poly_portfolio:
+                        if compact:
+                            p_line = f"P:${poly_portfolio['total']:.2f}"
+                        else:
+                            p_line = f"P: ${poly_portfolio['total']:.2f} (${poly_portfolio['cash']:.2f} cash + ${poly_portfolio['position_value']:.2f} pos×{poly_portfolio['position_count']})"
+                        combined_total += poly_portfolio['total']
+                        combined_positions += poly_portfolio['position_count']
+                    
+                    # Print header
+                    if k_line and p_line:
+                        # Both venues active — show combined + per-venue
+                        if compact:
+                            print(f"  🔴 {time_str} │ ${combined_total:.2f} │ {combined_positions}pos │ K:{kalshi_count} P:{poly_count}")
+                            print(f"     {k_line} │ {p_line}")
+                        else:
+                            print(f"  🔴 LIVE │ {time_str} │ COMBINED: ${combined_total:.2f} ({combined_positions} pos) │ Markets: K:{kalshi_count} P:{poly_count}{ws_str}")
+                            print(f"     {k_line}")
+                            print(f"     {p_line}")
+                    elif k_line:
+                        if compact:
+                            print(f"  🔴 {time_str} │ {k_line}{ws_str}")
+                        else:
+                            print(f"  🔴 LIVE │ {time_str} │ {k_line}{ws_str}")
+                    elif p_line:
+                        if compact:
+                            print(f"  🔴 {time_str} │ {p_line}{ws_str}")
+                        else:
+                            print(f"  🔴 LIVE │ {time_str} │ {p_line}{ws_str}")
                     else:
-                        print(f"  🔴 LIVE │ {time_str} │ K:{kalshi_count} │ (portfolio fetch failed){ws_str}")
+                        print(f"  🔴 LIVE │ {time_str} │ K:{kalshi_count} P:{poly_count} │ (portfolio fetch failed){ws_str}")
                 else:
                     roi_str = f" ({roi_pct:+.1f}% ROI)" if self.trade_count > 0 else ""
-                    print(f"  PAPER TRADER │ {time_str} │ K:{kalshi_count} │ {len(self.open_positions)} pos │ Net: {self.realized_pnl:+.0f}¢{roi_str} ({self.trade_count} trades) │ GrossUnreal: {unrealized_pnl:+.0f}¢")
-                print(f"{'═'*120}")
+                    print(f"  PAPER TRADER │ {time_str} │ K:{kalshi_count} P:{poly_count} │ {len(self.open_positions)} pos │ Net: {self.realized_pnl:+.0f}¢{roi_str} ({self.trade_count} trades) │ GrossUnreal: {unrealized_pnl:+.0f}¢")
+                print(f"{'═'*W}")
                 
                 # Show open positions first
                 live_positions = []
@@ -3053,7 +4213,9 @@ class PaperTrader:
                                 if current_bid == 0:
                                     continue
                                 
-                                pnl_cents = (current_bid - pos['entry_price']) * 100
+                                entry_price = pos['entry_price']
+                                
+                                pnl_cents = (current_bid - entry_price) * 100
                                 game_status = current_game.get('status', 'pre')
                                 
                                 pos_info = {
@@ -3085,6 +4247,7 @@ class PaperTrader:
                     if odds:
                         our_home = game['pregame_home_prob']
                         
+                        # Kalshi asks
                         k_home_yes = odds.get('home_yes_ask')
                         k_away_no = odds.get('away_no_ask')
                         k_home_ask = min(filter(None, [k_home_yes, k_away_no]), default=None)
@@ -3093,8 +4256,15 @@ class PaperTrader:
                         k_home_no = odds.get('home_no_ask')
                         k_away_ask = min(filter(None, [k_away_yes, k_home_no]), default=None)
                         
-                        home_ask = k_home_ask
-                        away_ask = k_away_ask
+                        # Polymarket asks
+                        p_home_ask = odds.get('poly_home_ask') if odds.get('has_polymarket') else None
+                        p_away_ask = odds.get('poly_away_ask') if odds.get('has_polymarket') else None
+                        
+                        # Best ask across venues
+                        home_asks = [x for x in [k_home_ask, p_home_ask] if x]
+                        away_asks = [x for x in [k_away_ask, p_away_ask] if x]
+                        home_ask = min(home_asks) if home_asks else None
+                        away_ask = min(away_asks) if away_asks else None
                         
                         if home_ask:
                             home_edge = our_home - (home_ask / 100.0)
@@ -3134,8 +4304,12 @@ class PaperTrader:
                     print("\n  No live games with predictions right now.\n")
                 else:
                     print(f"\n  🏀 LIVE ({len(live_games)} games)")
-                    print(f"  {'MATCHUP':<40} {'SCORE':^8} {'TIME':>8} {'MODEL':^7} {'──KALSHI──':^11} {'EDGE':>7}")
-                    print(f"  {'─'*78}")
+                    if compact:
+                        print(f"  {'MATCHUP':<{MW}} {'SCORE':^7} {'TIME':>6} {'MDL':^5} {'─K─':^8} {'─P─':^8} {'EDGE':>6}")
+                        print(f"  {'─'*(MW+44)}")
+                    else:
+                        print(f"  {'MATCHUP':<40} {'SCORE':^8} {'TIME':>8} {'MODEL':^7} {'─KALSHI─':^10} {'──POLY──':^10} {'EDGE':>7}")
+                        print(f"  {'─'*96}")
                     
                     games_with_edge = []
                     for game in live_games:
@@ -3146,36 +4320,43 @@ class PaperTrader:
                         if odds:
                             our_home = game['live_home_prob']
                             
-                            # Get best ask for HOME (min of home_yes_ask, away_no_ask)
+                            # Get best Kalshi ask for HOME (min of home_yes_ask, away_no_ask)
                             k_home_yes = odds.get('home_yes_ask')
                             k_away_no = odds.get('away_no_ask')
                             k_home_ask = min(filter(None, [k_home_yes, k_away_no]), default=None)
                             
-                            # Get best ask for AWAY (min of away_yes_ask, home_no_ask)
+                            # Get best Kalshi ask for AWAY (min of away_yes_ask, home_no_ask)
                             k_away_yes = odds.get('away_yes_ask')
                             k_home_no = odds.get('home_no_ask')
                             k_away_ask = min(filter(None, [k_away_yes, k_home_no]), default=None)
                             
-                            # Use Kalshi prices only
-                            home_ask = k_home_ask
-                            away_ask = k_away_ask
+                            # Get Polymarket asks
+                            p_home_ask = odds.get('poly_home_ask') if odds.get('has_polymarket') else None
+                            p_away_ask = odds.get('poly_away_ask') if odds.get('has_polymarket') else None
                             
-                            if home_ask:
-                                home_edge = our_home - (home_ask / 100.0)
-                                if home_edge > 0 and (best_edge is None or home_edge > best_edge):
+                            # Best ask across venues for each side
+                            home_asks = [x for x in [k_home_ask, p_home_ask] if x]
+                            away_asks = [x for x in [k_away_ask, p_away_ask] if x]
+                            best_home_ask = min(home_asks) if home_asks else None
+                            best_away_ask = min(away_asks) if away_asks else None
+                            
+                            # Calculate edges from best ask
+                            if best_home_ask:
+                                home_edge = our_home - (best_home_ask / 100.0)
+                                if best_edge is None or home_edge > (best_edge or -999):
                                     best_edge = home_edge
                                     best_side = 'home'
-                            if away_ask:
-                                away_edge = (1 - our_home) - (away_ask / 100.0)
-                                if away_edge > 0 and (best_edge is None or away_edge > best_edge):
+                            if best_away_ask:
+                                away_edge = (1 - our_home) - (best_away_ask / 100.0)
+                                if best_edge is None or away_edge > (best_edge or -999):
                                     best_edge = away_edge
                                     best_side = 'away'
                             
-                            # If no positive edge, show the better one
+                            # If no positive edge, show the better negative one
                             if best_edge is None:
-                                if home_ask and away_ask:
-                                    home_e = our_home - (home_ask / 100.0)
-                                    away_e = (1 - our_home) - (away_ask / 100.0)
+                                if best_home_ask and best_away_ask:
+                                    home_e = our_home - (best_home_ask / 100.0)
+                                    away_e = (1 - our_home) - (best_away_ask / 100.0)
                                     if home_e > away_e:
                                         best_edge = home_e
                                         best_side = 'home'
@@ -3192,9 +4373,12 @@ class PaperTrader:
                         self.log_snapshot(game, odds, commit=False)
                         
                         # Format matchup
-                        away = strip_mascot(game['away_team'])[:18]
-                        home = strip_mascot(game['home_team'])[:18]
-                        matchup = f"{away:<18} @ {home}"
+                        away = strip_mascot(game['away_team'])[:TW]
+                        home = strip_mascot(game['home_team'])[:TW]
+                        if compact:
+                            matchup = f"{away:<{TW}} @ {home}"
+                        else:
+                            matchup = f"{away:<18} @ {home}"
                         
                         score = f"{game['away_score']}-{game['home_score']}"
                         time_str = f"P{game['period']} {game['clock']:>5}"
@@ -3211,63 +4395,76 @@ class PaperTrader:
                         
                         game_id = game['game_id']
                         
+                        k_str = "   --"
+                        p_str = "   --"
+                        edge_str = "   --"
+                        
                         if odds:
-                            # Get prices for the relevant side (best of YES vs NO)
+                            # Get Kalshi prices for the edge side (best of YES vs NO)
                             if edge_side == 'home':
-                                # Betting home: compare home_yes_ask vs away_no_ask
                                 k_yes_ask = odds.get('home_yes_ask')
                                 k_no_ask = odds.get('away_no_ask')
                                 k_yes_bid = odds.get('home_yes_bid')
                                 k_no_bid = odds.get('away_no_bid')
-                                
-                                # Pick better Kalshi price
-                                if k_yes_ask and k_no_ask:
-                                    if k_no_ask < k_yes_ask:
-                                        k_ask, k_bid = k_no_ask, k_no_bid
-                                    else:
-                                        k_ask, k_bid = k_yes_ask, k_yes_bid
-                                elif k_yes_ask:
-                                    k_ask, k_bid = k_yes_ask, k_yes_bid
-                                elif k_no_ask:
-                                    k_ask, k_bid = k_no_ask, k_no_bid
-                                else:
-                                    k_ask, k_bid = None, None
+                                p_ask_raw = odds.get('poly_home_ask') if odds.get('has_polymarket') else None
+                                p_bid_raw = odds.get('poly_home_bid') if odds.get('has_polymarket') else None
                             else:
-                                # Betting away: compare away_yes_ask vs home_no_ask
                                 k_yes_ask = odds.get('away_yes_ask')
                                 k_no_ask = odds.get('home_no_ask')
                                 k_yes_bid = odds.get('away_yes_bid')
                                 k_no_bid = odds.get('home_no_bid')
-                                
-                                # Pick better Kalshi price
-                                if k_yes_ask and k_no_ask:
-                                    if k_no_ask < k_yes_ask:
-                                        k_ask, k_bid = k_no_ask, k_no_bid
-                                    else:
-                                        k_ask, k_bid = k_yes_ask, k_yes_bid
-                                elif k_yes_ask:
-                                    k_ask, k_bid = k_yes_ask, k_yes_bid
-                                elif k_no_ask:
+                                p_ask_raw = odds.get('poly_away_ask') if odds.get('has_polymarket') else None
+                                p_bid_raw = odds.get('poly_away_bid') if odds.get('has_polymarket') else None
+                            
+                            # Pick best Kalshi price (YES vs NO)
+                            if k_yes_ask and k_no_ask:
+                                if k_no_ask < k_yes_ask:
                                     k_ask, k_bid = k_no_ask, k_no_bid
                                 else:
-                                    k_ask, k_bid = None, None
+                                    k_ask, k_bid = k_yes_ask, k_yes_bid
+                            elif k_yes_ask:
+                                k_ask, k_bid = k_yes_ask, k_yes_bid
+                            elif k_no_ask:
+                                k_ask, k_bid = k_no_ask, k_no_bid
+                            else:
+                                k_ask, k_bid = None, None
+                            
+                            # Determine best ask across venues and add star
+                            k_star = ""
+                            p_star = ""
+                            if k_ask and p_ask_raw:
+                                if k_ask <= p_ask_raw:
+                                    k_star = "★"
+                                else:
+                                    p_star = "★"
+                            elif k_ask:
+                                k_star = "★"
+                            elif p_ask_raw:
+                                p_star = "★"
                             
                             # Format Kalshi column
                             if k_ask and k_bid:
-                                k_str = f"{k_ask:2.0f}¢({k_ask-k_bid:.0f})"
-                            else:
-                                k_str = "  --"
+                                k_spread = k_ask - k_bid
+                                k_str = f"{k_ask:2.0f}¢({k_spread:.0f}){k_star}"
+                            elif k_ask:
+                                k_str = f"{k_ask:2.0f}¢   {k_star}"
                             
-                            # Edge calculation
+                            # Format Poly column
+                            if p_ask_raw and p_bid_raw:
+                                p_spread = p_ask_raw - p_bid_raw
+                                p_str = f"{p_ask_raw:2.0f}¢({p_spread:.0f}){p_star}"
+                            elif p_ask_raw:
+                                p_str = f"{p_ask_raw:2.0f}¢   {p_star}"
+                            
+                            # Edge from best book
                             if edge is not None:
                                 edge_str = f"{edge*100:+5.1f}%"
-                            else:
-                                edge_str = "   --"
-                        else:
-                            k_str = "  --"
-                            edge_str = "   --"
                         
-                        print(f"  {matchup:<40} {score:^8} {time_str:>8} {model_str:^7} {k_str:^11} {edge_str:>7}")
+                        if compact:
+                            time_short = f"{game['period']}{game['clock']:>5}"
+                            print(f"  {matchup:<{MW}} {score:^7} {time_short:>6} {model_str:^5} {k_str:^8} {p_str:^8} {edge_str:>6}")
+                        else:
+                            print(f"  {matchup:<40} {score:^8} {time_str:>8} {model_str:^7} {k_str:^10} {p_str:^10} {edge_str:>7}")
                         
                         # Check for exit on open positions (handles kalshi: prefix keys too)
                         pos_key = self._find_position_for_game(game_id, odds)
@@ -3308,26 +4505,24 @@ class PaperTrader:
                 # Show live positions individually (at bottom)
                 if live_positions:
                     print(f"\n  📊 LIVE POSITIONS ({len(live_positions)})")
-                    print(f"  {'GAME':<40} {'TYPE':<8} {'ENTRY':>6} {'BID':>6} {'SELL@':>6} {'GROSS':>6} {'STATUS':<10}")
-                    print(f"  {'-'*90}")
+                    if compact:
+                        print(f"  {'GAME':<{MW}} {'TY':<4} {'ENT':>4} {'BID':>5} {'SL@':>5} {'GRS':>5}")
+                        print(f"  {'-'*(MW+27)}")
+                    else:
+                        print(f"  {'GAME':<40} {'TYPE':<8} {'ENTRY':>6} {'K BID':>7} {'P BID':>7} {'SELL@':>6} {'GROSS':>6} {'STATUS':<10}")
+                        print(f"  {'-'*100}")
                     
                     for p in live_positions:
                         pos = p['pos']
                         current_game = p['game']
                         pnl_cents = p['pnl_cents']
                         
-                        if self.STOP_LOSS_CENTS and pnl_cents <= -self.STOP_LOSS_CENTS:
-                            status = "⚠️ STOP"
-                        elif pnl_cents > 5:
-                            status = "✅ UP"
-                        elif pnl_cents < -5:
-                            status = "❌ DOWN"
+                        away = strip_mascot(current_game['away_team'])[:TW]
+                        home = strip_mascot(current_game['home_team'])[:TW]
+                        if compact:
+                            matchup = f"{away:<{TW}} @ {home}"
                         else:
-                            status = "⬜ FLAT"
-                        
-                        away = strip_mascot(current_game['away_team'])[:18]
-                        home = strip_mascot(current_game['home_team'])[:18]
-                        matchup = f"{away:<18} @ {home}"
+                            matchup = f"{away:<18} @ {home}"
                         
                         type_labels = {'home_yes': 'HY', 'home_no': 'HN', 'away_yes': 'AY', 'away_no': 'AN'}
                         type_label = type_labels.get(p['contract_type'], 'HY')
@@ -3340,9 +4535,62 @@ class PaperTrader:
                             our_prob = 1 - our_prob
                         time_rem = current_game.get('time_remaining_sec', 2400)
                         abs_margin = abs(current_game.get('home_score', 0) - current_game.get('away_score', 0))
-                        min_sell = self.compute_min_sell_bid(time_rem, our_prob, abs_margin)
+                        min_sell = self.compute_min_sell_bid(time_rem, our_prob, abs_margin, venue=p['market_source'])
                         
-                        print(f"  {matchup:<40} {type_label}{venue:<5} {pos['entry_price']*100:5.0f}¢ {p['current_bid']*100:5.0f}¢ {min_sell:5.0f}¢ {pnl_cents:+5.0f}¢ {status:<10}")
+                        # Get bids from both venues
+                        odds = p['odds']
+                        k_bid_cents = 0
+                        p_bid_cents = 0
+                        
+                        if odds:
+                            # Kalshi bid for this contract type
+                            k_bid_map = {
+                                'home_yes': 'home_yes_bid', 'home_no': 'home_no_bid',
+                                'away_yes': 'away_yes_bid', 'away_no': 'away_no_bid'
+                            }
+                            k_bid_key = k_bid_map.get(p['contract_type'], 'home_yes_bid')
+                            k_bid_cents = odds.get(k_bid_key, 0) or 0
+                            
+                            # Polymarket bid (YES contracts only, mapped to our side)
+                            if odds.get('has_polymarket'):
+                                if side == 'home':
+                                    p_bid_cents = odds.get('poly_home_bid', 0) or 0
+                                else:
+                                    p_bid_cents = odds.get('poly_away_bid', 0) or 0
+                        
+                        # Star the venue we're actually on
+                        k_star = "★" if p['market_source'] == 'Kalshi' else ""
+                        p_star = "★" if p['market_source'] == 'Polymarket' else ""
+                        
+                        k_bid_str = f"{k_bid_cents:4.0f}¢{k_star}" if k_bid_cents > 0 else "   --"
+                        p_bid_str = f"{p_bid_cents:4.0f}¢{p_star}" if p_bid_cents > 0 else "   --"
+                        
+                        entry_display = pos['entry_price'] * 100
+                        
+                        # Display gross: starred bid minus entry
+                        our_bid_cents = k_bid_cents if p['market_source'] == 'Kalshi' else p_bid_cents
+                        gross_display = our_bid_cents - entry_display
+                        
+                        # Status based on display gross
+                        if self.STOP_LOSS_CENTS and gross_display <= -self.STOP_LOSS_CENTS:
+                            status = "⚠️ STOP"
+                        elif gross_display > 5:
+                            status = "✅ UP"
+                        elif gross_display < -5:
+                            status = "❌ DOWN"
+                        else:
+                            status = "⬜ FLAT"
+                        
+                        if compact:
+                            # Pre-format to fixed widths for alignment
+                            ty_str = f"{type_label}{venue}"
+                            ent_str = f"{entry_display:.0f}¢"
+                            bid_str = f"{our_bid_cents:.0f}¢★" if our_bid_cents > 0 else "--"
+                            sl_str = f"{min_sell:.0f}¢"
+                            grs_str = f"{gross_display:+.0f}¢"
+                            print(f"  {matchup:<{MW}} {ty_str:<4} {ent_str:>4} {bid_str:>5} {sl_str:>5} {grs_str:>5}")
+                        else:
+                            print(f"  {matchup:<40} {type_label}{venue:<5} {entry_display:5.0f}¢ {k_bid_str:>7} {p_bid_str:>7} {min_sell:5.0f}¢ {gross_display:+5.0f}¢ {status:<10}")
                 
                 # Show pregame positions as condensed summary
                 if pregame_positions:
@@ -3362,30 +4610,46 @@ class PaperTrader:
                 # Batch commit all snapshots from this cycle
                 self.conn.commit()
                 
-                print(f"\n{'═'*120}")
+                print(f"\n{'═'*W}")
                 # Real ROI = profit / peak capital deployed
                 roi_pct = (self.realized_pnl / self.peak_capital_deployed * 100) if self.peak_capital_deployed > 0 else 0
                 roi_str = f" ({roi_pct:+.1f}% ROI)" if self.trade_count > 0 else ""
                 
                 # Smart sleep: only wait the remainder of poll_interval
                 elapsed = time.time() - cycle_start
-                sleep_time = max(0, poll_interval - elapsed)
+                sleep_time = max(1.0 - elapsed, 0)
                 cycle_info = f"cycle: {elapsed:.1f}s"
                 
-                if self.live_mode and kalshi_portfolio:
-                    session_pnl = kalshi_portfolio['session_pnl']
-                    pnl_str = f"+${session_pnl:.2f}" if session_pnl >= 0 else f"-${abs(session_pnl):.2f}"
-                    print(f"  📊 Portfolio: ${kalshi_portfolio['total']:.2f} │ Session: {pnl_str} │ {kalshi_portfolio['position_count']} positions │ {cycle_info} │ Ctrl+C to stop")
+                if self.live_mode and (kalshi_portfolio or poly_portfolio):
+                    combined_total = 0.0
+                    combined_positions = 0
+                    parts = []
+                    if kalshi_portfolio:
+                        combined_total += kalshi_portfolio['total']
+                        combined_positions += kalshi_portfolio['position_count']
+                        session_pnl = kalshi_portfolio['session_pnl']
+                        pnl_str = f"+${session_pnl:.2f}" if session_pnl >= 0 else f"-${abs(session_pnl):.2f}"
+                        parts.append(f"K:${kalshi_portfolio['total']:.2f} ({pnl_str})")
+                    if poly_portfolio:
+                        combined_total += poly_portfolio['total']
+                        combined_positions += poly_portfolio['position_count']
+                        parts.append(f"P:${poly_portfolio['total']:.2f}")
+                    venue_str = " │ ".join(parts)
+                    if compact:
+                        print(f"  📊 ${combined_total:.2f} │ {venue_str} │ {combined_positions} pos │ {cycle_info}")
+                    else:
+                        print(f"  📊 Combined: ${combined_total:.2f} │ {venue_str} │ {combined_positions} positions │ {cycle_info} │ Ctrl+C to stop")
                 else:
                     print(f"  📊 Net: {self.realized_pnl:+.0f}¢{roi_str} realized | {len(self.open_positions)} open ({unrealized_pnl:+.0f}¢ gross) | {self.trade_count} trades | {cycle_info} | Ctrl+C to stop")
                 
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                time.sleep(max(1.5 - (time.time() - cycle_start), 0.1))
                 
         except KeyboardInterrupt:
-            # Clean up WebSocket
+            # Clean up WebSockets
             if self.ws_book:
                 self.ws_book.stop()
+            if self.poly_ws_book:
+                self.poly_ws_book.stop()
             print("\n\nStopped. Use --review to see logged trades.")
     
     def _handle_entry(self, opp: dict):
@@ -3509,6 +4773,166 @@ class PaperTrader:
                 except Exception as e:
                     print(f"  ❌ ORDER ERROR: {e}")
                     return  # Don't track position if live order failed
+        
+        # === LIVE TRADING: Polymarket ===
+        if self.live_mode and self.poly_client and market_source == 'Polymarket':
+            slug = opp.get('market_ticker')  # For Poly, market_ticker holds the slug
+            if slug:
+                contracts_to_order = self.live_contracts
+                
+                # === HARD CAP: Fresh Polymarket query as SOLE source of truth ===
+                # Same safety posture as Kalshi: query API before every order
+                try:
+                    poly_positions = self._get_poly_positions()
+                    if poly_positions is None:
+                        print(f"\n  🛡️ Poly position check failed (API unavailable) — BLOCKING order for safety")
+                        return  # If we can't verify, don't risk over-accumulation
+                    
+                    # Count existing contracts on this slug
+                    existing_poly_count = 0
+                    if slug in poly_positions:
+                        existing_poly_count = poly_positions[slug]['quantity']
+                    
+                    if existing_poly_count >= self.live_contracts:
+                        print(f"\n  🛡️ HARD CAP: Already {existing_poly_count} contracts on Polymarket (target={self.live_contracts})")
+                        # Register in open_positions so we stop checking
+                        if game_id not in self.open_positions:
+                            self.open_positions[game_id] = {
+                                'trade_id': None, 'side': side, 'entry_price': entry_price,
+                                'entry_time': None, 'entry_status': 'unknown',
+                                'home_team': opp['home_team'], 'away_team': opp['away_team'],
+                                'market_ticker': slug, 'market_source': 'Polymarket',
+                                'contract_type': contract_type,
+                                'live_fill_count': existing_poly_count,
+                                'live_avg_price': None, 'live_order_id': None
+                            }
+                        return
+                    
+                    contracts_to_order = min(contracts_to_order, self.live_contracts - existing_poly_count)
+                    if contracts_to_order <= 0:
+                        return
+                    
+                    if existing_poly_count > 0:
+                        print(f"  📈 TOP-UP: {existing_poly_count}/{self.live_contracts} on Polymarket, ordering {contracts_to_order} more")
+                    
+                except Exception as e:
+                    print(f"  🛡️ Fresh Poly position check failed: {e} — BLOCKING order for safety")
+                    return  # If we can't verify, don't risk over-accumulation
+                
+                # Map side to Polymarket intent
+                # BBO is for outcome team (away in CBB)
+                # home_yes → BUY_SHORT (bet against outcome team = bet home)
+                # away_yes → BUY_LONG (bet on outcome team = bet away)
+                if 'away' in contract_type:
+                    intent = 'ORDER_INTENT_BUY_LONG'
+                else:
+                    intent = 'ORDER_INTENT_BUY_SHORT'
+                
+                # Smart price walk-up (keep full float precision from BBO)
+                home_price_cents = entry_price * 100
+                time_remaining = opp.get('time_remaining_sec', 2400)
+                required_edge = self.get_required_edge(entry_price, time_remaining)
+                current_edge = opp['our_prob'] - entry_price
+                
+                buffer = 0
+                if current_edge - 0.01 >= required_edge:
+                    buffer = 1
+                    if current_edge - 0.02 >= required_edge:
+                        buffer = 2
+                
+                if 'away' in contract_type:
+                    # BUY_LONG: price = away ask, higher = more aggressive
+                    raw_price_cents = home_price_cents
+                    price_cents = min(99, raw_price_cents + buffer)
+                    buf_str = f" +{buffer}¢ buf" if buffer > 0 else ""
+                else:
+                    # BUY_SHORT: SDK sends SELL on away token
+                    # Must complement price: home 55¢ → sell away at 45¢ floor
+                    # Lower floor = more aggressive for sells
+                    raw_price_cents = 100 - home_price_cents
+                    price_cents = max(1, raw_price_cents - buffer)
+                
+                price_decimal = price_cents / 100.0
+                bet_team = opp['home_team'][:20] if side == 'home' else opp['away_team'][:20]
+                if intent == 'ORDER_INTENT_BUY_SHORT':
+                    print(f"\n  🟣 POLY BUY SHORT: {bet_team} @ {home_price_cents:.1f}¢ (CLOB: sell away @ {price_cents:.1f}¢{f' -{buffer}¢ buf' if buffer else ''}) x {contracts_to_order}")
+                else:
+                    print(f"\n  🟣 POLY BUY LONG: {bet_team} @ {price_cents:.1f}¢{f' (+{buffer}¢ buf)' if buffer else ''} x {contracts_to_order}")
+                
+                try:
+                    result = self.poly_client.orders.create({
+                        "marketSlug": slug,
+                        "intent": intent,
+                        "type": "ORDER_TYPE_LIMIT",
+                        "price": {"value": f"{price_cents / 100:.4f}", "currency": "USD"},
+                        "quantity": contracts_to_order,
+                        "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+                    })
+                    
+                    # SDK returns 'executions' not 'fills'
+                    fills = result.get('executions', []) or result.get('fills', [])
+                    if fills:
+                        print(f"  📋 Execution[0] keys: {list(fills[0].keys()) if isinstance(fills[0], dict) else type(fills[0])}")
+                    fill_count = sum(int(float(f.get('quantity', 0))) if isinstance(f.get('quantity', 0), str) else f.get('quantity', 0) for f in fills)
+                    poly_pos = None  # Will be populated if needed
+                    
+                    # Fallback: check positions API if no fills parsed
+                    if fill_count == 0:
+                        print(f"  📋 Order response keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
+                        # Check for alternative fill indicators
+                        status_str = result.get('status', '') if isinstance(result, dict) else ''
+                        qty_filled = result.get('quantityFilled') or result.get('filledQuantity') or result.get('filled_quantity')
+                        if qty_filled:
+                            fill_count = int(float(qty_filled))
+                            print(f"  📋 Found fill via quantityFilled: {fill_count}")
+                        elif status_str and 'FILL' in status_str.upper():
+                            # Status indicates fill, verify via positions API
+                            print(f"  📋 Order status: {status_str}, checking positions...")
+                            fill_count = contracts_to_order  # Assume full fill, verify below
+                        
+                        # Last resort: check positions API for actual holdings
+                        if fill_count == 0:
+                            import time as _time
+                            _time.sleep(0.5)
+                            poly_pos = self._get_poly_positions()
+                            if poly_pos and slug in poly_pos:
+                                actual_qty = poly_pos[slug]['quantity']
+                                if actual_qty > 0:
+                                    fill_count = min(actual_qty, contracts_to_order)
+                                    print(f"  📋 Detected fill via positions API: {fill_count} contracts on {slug}")
+                    
+                    if fill_count > 0:
+                        # Entry price in home-probability terms from our known limit.
+                        # IOC fills at limit or not at all, so this is exact.
+                        # Avoids ambiguity in SDK fill price semantics (CLOB vs buyer side).
+                        if intent == 'ORDER_INTENT_BUY_SHORT':
+                            # We sent SELL away @ price_cents (e.g. 80¢). Home equiv = complement.
+                            avg_price_decimal = 1.0 - (price_cents / 100.0)
+                        else:
+                            # BUY_LONG: CLOB price IS the entry price
+                            avg_price_decimal = price_cents / 100.0
+                        
+                        # Fees on raw CLOB price
+                        fee_cents = poly_fee_cents(price_cents / 100.0) * fill_count
+                        
+                        live_fill_count = fill_count
+                        live_avg_price = round(avg_price_decimal * 100, 1)
+                        live_order_id = result.get('orderId') or result.get('id') or result.get('order_id')
+                        entry_price = avg_price_decimal
+                        opp['entry_price'] = entry_price
+                        print(f"  ✓ FILLED {fill_count} @ {live_avg_price:.0f}¢ (fees: ~{fee_cents:.2f}¢)")
+                        
+                        # === POST-TRADE VERIFICATION ===
+                        verified_qty = self._verify_poly_position(slug, fill_count, action='buy')
+                        if verified_qty is not None and verified_qty == 0:
+                            print(f"  ⚠️ ANOMALY: Fill reported but no position found on Polymarket!")
+                            # Still log the trade, but flag it
+                    else:
+                        print(f"  ❌ NO FILL: Order not filled on Polymarket")
+                        return
+                except Exception as e:
+                    print(f"  ❌ POLY ORDER ERROR: {e}")
+                    return
         
         # Log the entry to database
         trade_id = self.log_opportunity(opp, f'ENTRY ({status.upper()})')
@@ -3688,19 +5112,22 @@ def main():
     parser.add_argument('--analyze', action='store_true', help='Analyze completed trades')
     parser.add_argument('--live', action='store_true', help='Enable LIVE trading on Kalshi (real money!)')
     parser.add_argument('--contracts', type=int, default=10, help='Number of contracts per trade in live mode (default: 10)')
+    parser.add_argument('--venue', choices=['kalshi', 'polymarket', 'best'], default='best',
+                        help='Trading venue: kalshi (Kalshi only), polymarket (Poly only), best (pick best net EV)')
     args = parser.parse_args()
     
     # Safety confirmation for live mode
     if args.live:
         print("⚠️  WARNING: LIVE TRADING MODE ⚠️")
-        print("This will place REAL orders with REAL money on Kalshi!")
+        venues = {'kalshi': 'Kalshi', 'polymarket': 'Polymarket', 'best': 'Kalshi + Polymarket (best EV)'}
+        print(f"This will place REAL orders with REAL money on {venues[args.venue]}!")
         print(f"Position size: {args.contracts} contracts per trade")
         confirm = input("\nType 'live' to confirm: ")
         if confirm != 'live':
             print("Cancelled.")
             sys.exit(0)
     
-    trader = PaperTrader(args.db, live_mode=args.live, live_contracts=args.contracts)
+    trader = PaperTrader(args.db, live_mode=args.live, live_contracts=args.contracts, venue=args.venue)
     
     if args.review:
         trader.review_opportunities()

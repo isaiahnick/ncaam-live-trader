@@ -9,6 +9,7 @@ End-to-end pipeline:
   3b. Diagnostic: show OV by probability bucket (visualize asymmetry)
   4. Fit the asymmetric closed-form formula to the BI output
   5. Print updated constants for live_trader.py
+  6. Calibrate microstate haircut H(t, margin) for exit threshold
 
 KEY INSIGHT (v3):
   The v2 approach tried to force asymmetry onto BI output that was symmetric,
@@ -679,9 +680,225 @@ def fit_formula(OV_cond, OV_flat, pregame_margins, n_steps, dt):
 
 
 # ===================================================================
+# STEP 6: Calibrate microstate haircut H(t, margin)
+# ===================================================================
+def calibrate_haircut(conn):
+    """Calibrate exit haircut for unobserved microstate (possession, FT, fouls).
+    
+    Late in close games, market makers see microstate our model can't.
+    This measures the EXCESS residual dispersion in (time, margin) buckets
+    and fits a smooth function H(t, m) to add to ev_hold on exits.
+    
+    Returns:
+        haircut_params: dict with best fit parameters, or None if insufficient data
+    """
+    print(f"\n{'=' * 65}")
+    print("STEP 6: Calibrating microstate haircut H(t, margin)")
+    print("=" * 65)
+    
+    # Pull residuals WITH score context (no time_remaining floor — we want late-game)
+    rows = conn.execute("""
+        SELECT
+            time_remaining_sec,
+            home_score,
+            away_score,
+            live_home_prob,
+            home_yes_bid,
+            away_yes_bid
+        FROM live_snapshots
+        WHERE home_yes_bid IS NOT NULL
+          AND live_home_prob IS NOT NULL
+          AND home_yes_bid > 0
+          AND live_home_prob > 0.01 AND live_home_prob < 0.99
+          AND game_status = 'in'
+          AND time_remaining_sec > 0
+          AND home_score IS NOT NULL
+          AND away_score IS NOT NULL
+    """).fetchall()
+    
+    if len(rows) < 1000:
+        print(f"  ⚠️ Only {len(rows)} snapshots with score data — need more for haircut calibration")
+        return None
+    
+    # Build observations: (time_remaining, abs_margin, residual)
+    observations = []
+    for time_rem, hs, as_, hp, hbid, abid in rows:
+        abs_margin = abs(hs - as_)
+        observations.append((time_rem, abs_margin, hbid - hp * 100))
+        if abid is not None and abid > 0:
+            observations.append((time_rem, abs_margin, abid - (1 - hp) * 100))
+    
+    data = np.array(observations)
+    times = data[:, 0]
+    margins = data[:, 1]
+    resids = data[:, 2]
+    
+    print(f"  Observations: {len(data):,}")
+    
+    # === MARGIN-CONDITIONAL BASELINE ===
+    # Use 20:00-40:00 (first half) dispersion for each margin bucket as baseline.
+    # This removes persistent close-game model-market disagreement and isolates
+    # the TIME-DEPENDENT microstate component (possession, FT, fouls).
+    margin_edges = [0, 1, 2, 3, 5, 7, 10, 15, 50]
+    baseline_sigmas = {}  # margin_bucket_idx -> sigma
+    
+    print(f"  === MARGIN-CONDITIONAL BASELINES (from 20:00-40:00) ===")
+    print(f"  {'Margin':>10} {'Count':>7} {'σ_base':>8}")
+    print(f"  {'-' * 30}")
+    
+    for j in range(len(margin_edges) - 1):
+        m_lo, m_hi = margin_edges[j], margin_edges[j + 1]
+        base_mask = (times >= 1200) & (margins >= m_lo) & (margins < m_hi)
+        if base_mask.sum() >= 50:
+            q25, q75 = np.percentile(resids[base_mask], [25, 75])
+            baseline_sigmas[j] = (q75 - q25) / 1.349
+        else:
+            # Fallback: global early-game baseline
+            safe_mask = (times > 720) & (margins > 7)
+            q25, q75 = np.percentile(resids[safe_mask], [25, 75])
+            baseline_sigmas[j] = (q75 - q25) / 1.349
+        margin_label = f"|m|={m_lo}-{m_hi}"
+        print(f"  {margin_label:>10} {base_mask.sum():>7,} {baseline_sigmas[j]:>7.2f}¢")
+    
+    # === BUCKET DISPERSION ===
+    time_edges = [0, 60, 120, 180, 240, 360, 480, 720, 1200, 2400]
+    
+    bucket_data = []  # (t_mid, m_mid, excess_sigma, count)
+    
+    print(f"\n  {'Time':>14} {'Margin':>10} {'Count':>7} {'σ(IQR)':>8} {'σ_base':>8} {'Excess':>8}")
+    print(f"  {'-' * 65}")
+    
+    for i in range(len(time_edges) - 1):
+        t_lo, t_hi = time_edges[i], time_edges[i + 1]
+        for j in range(len(margin_edges) - 1):
+            m_lo, m_hi = margin_edges[j], margin_edges[j + 1]
+            
+            mask = (times >= t_lo) & (times < t_hi) & (margins >= m_lo) & (margins < m_hi)
+            if mask.sum() < 30:
+                continue
+            
+            bq25, bq75 = np.percentile(resids[mask], [25, 75])
+            sigma = (bq75 - bq25) / 1.349
+            baseline = baseline_sigmas.get(j, 2.65)
+            excess = max(0, sigma - baseline)
+            
+            t_mid = (t_lo + t_hi) / 2
+            m_mid = (m_lo + m_hi) / 2
+            bucket_data.append((t_mid, m_mid, excess, mask.sum()))
+            
+            time_label = f"{t_lo//60}:{t_lo%60:02d}-{t_hi//60}:{t_hi%60:02d}"
+            margin_label = f"|m|={m_lo}-{m_hi}"
+            ex_str = f"{excess:.2f}¢" if excess > 0.3 else "  ---"
+            print(f"  {time_label:>14} {margin_label:>10} {mask.sum():>7,} {sigma:>7.2f}¢ {baseline:>7.2f}¢ {ex_str:>8}")
+    
+    if len(bucket_data) < 5:
+        print(f"  ⚠️ Not enough buckets for fitting")
+        return None
+    
+    bd = np.array(bucket_data)
+    t_arr = bd[:, 0]
+    m_arr = bd[:, 1]
+    excess_arr = bd[:, 2]
+    weights = bd[:, 3]
+    weights = weights / weights.sum()
+    
+    # === FIT: H = scale × exp(-t/tau) × exp(-m/decay) ===
+    # Only fit to buckets where haircut matters (late + close)
+    fit_mask = (t_arr < 600) & (m_arr < 12)
+    if fit_mask.sum() < 4:
+        print(f"  ⚠️ Not enough late-close buckets for fitting, using defaults")
+        return {
+            'scale': 4.0, 'tau': 90.0, 'decay': 2.5,
+            'formula': 'exponential', 'rmse': None, 'baseline_sigmas': baseline_sigmas
+        }
+    
+    t_fit = t_arr[fit_mask]
+    m_fit = m_arr[fit_mask]
+    ex_fit = excess_arr[fit_mask]
+    w_fit = weights[fit_mask]
+    w_fit = w_fit / w_fit.sum()
+    
+    def objective(params):
+        scale, tau, decay = params
+        pred = scale * np.exp(-t_fit / tau) * np.exp(-m_fit / decay)
+        return np.sum(w_fit * (pred - ex_fit) ** 2)
+    
+    bounds = [(0.5, 20.0), (30.0, 300.0), (0.5, 10.0)]
+    de_result = differential_evolution(objective, bounds, seed=42, maxiter=500)
+    result = minimize(objective, de_result.x, method='Nelder-Mead',
+                      options={'maxiter': 10000})
+    scale, tau, decay = result.x
+    
+    pred = scale * np.exp(-t_fit / tau) * np.exp(-m_fit / decay)
+    rmse = np.sqrt(np.mean((pred - ex_fit) ** 2))
+    
+    print(f"\n  === FIT: H = {scale:.2f} × exp(-t/{tau:.0f}) × exp(-|m|/{decay:.1f}) ===")
+    print(f"  RMSE: {rmse:.3f}¢")
+    
+    # === Show haircut at key scenarios ===
+    print(f"\n  === HAIRCUT VALUES (¢) ===")
+    print(f"  {'Scenario':<35} {'H':>6}")
+    print(f"  {'-' * 45}")
+    
+    scenarios = [
+        ("t=0:30, |m|=0 (endgame tied)",     30, 0),
+        ("t=0:30, |m|=1",                     30, 1),
+        ("t=0:30, |m|=3",                     30, 3),
+        ("t=1:00, |m|=0",                     60, 0),
+        ("t=1:00, |m|=2",                     60, 2),
+        ("t=2:00, |m|=0",                    120, 0),
+        ("t=2:00, |m|=3",                    120, 3),
+        ("t=3:00, |m|=0",                    180, 0),
+        ("t=3:00, |m|=5",                    180, 5),
+        ("t=4:00, |m|=0 (entry cutoff)",     240, 0),
+        ("t=4:00, |m|=3",                    240, 3),
+        ("t=8:00, |m|=0",                    480, 0),
+        ("t=8:00, |m|=5",                    480, 5),
+        ("t=15:00, |m|=0",                   900, 0),
+        ("t=20:00, |m|=10",                 1200, 10),
+    ]
+    
+    for label, t, m in scenarios:
+        h = scale * math.exp(-t / tau) * math.exp(-m / decay)
+        print(f"  {label:<35} {h:5.2f}¢")
+    
+    # Multiplier interpretation
+    print(f"\n  === INTERPRETATION ===")
+    print(f"  At k=0.5 (conservative): multiply H by 0.5")
+    print(f"  At k=1.0 (full σ):       use H as-is")
+    print(f"  At k=1.5 (aggressive):   multiply H by 1.5")
+    print(f"  Recommend starting at k=1.0 (1 excess σ of uncertainty premium)")
+    
+    params_dict = {
+        'scale': round(scale, 2),
+        'tau': round(tau, 0),
+        'decay': round(decay, 1),
+        'formula': 'exponential',
+        'rmse': rmse,
+        'baseline_sigmas': baseline_sigmas,
+    }
+    
+    print(f"\n  === CODE FOR live_trader.py ===")
+    print(f"""
+    # Microstate haircut (exits only):
+    # H(t, m) = HAIRCUT_SCALE × exp(-t / HAIRCUT_TAU) × exp(-|m| / HAIRCUT_MARGIN_DECAY)
+    HAIRCUT_SCALE = {params_dict['scale']}
+    HAIRCUT_TAU = {params_dict['tau']:.0f}
+    HAIRCUT_MARGIN_DECAY = {params_dict['decay']}
+
+    def compute_haircut(self, time_remaining_sec: int, abs_margin: int) -> float:
+        \"\"\"Microstate uncertainty premium (cents). Added to ev_hold on exits.
+        Late in close games, MMs see possession/FT/fouls we can't.\"\"\"
+        return self.HAIRCUT_SCALE * math.exp(-time_remaining_sec / self.HAIRCUT_TAU) * math.exp(-abs_margin / self.HAIRCUT_MARGIN_DECAY)
+""")
+    
+    return params_dict
+
+
+# ===================================================================
 # STEP 5: Output
 # ===================================================================
-def print_results(scale, exponent, gamma, decorr_sec, global_mean, global_std, rmse, n_snapshots, old_params=None):
+def print_results(scale, exponent, gamma, decorr_sec, global_mean, global_std, rmse, n_snapshots, old_params=None, haircut_params=None):
     """Print the final constants."""
     print(f"\n{'=' * 65}")
     print("RESULTS: Updated constants for live_trader.py")
@@ -741,8 +958,18 @@ def print_results(scale, exponent, gamma, decorr_sec, global_mean, global_std, r
         return fsp + cv
 """)
 
+    if haircut_params:
+        hp = haircut_params
+        print(f"\n  # Microstate haircut (exits only):")
+        print(f"  # H(t, m) = {hp['scale']} × exp(-t/{hp['tau']:.0f}) × exp(-|m|/{hp['decay']})")
+        print(f"  HAIRCUT_SCALE = {hp['scale']}")
+        print(f"  HAIRCUT_TAU = {hp['tau']:.0f}")
+        print(f"  HAIRCUT_MARGIN_DECAY = {hp['decay']}")
+        if hp.get('rmse') is not None:
+            print(f"  Haircut RMSE: {hp['rmse']:.3f}¢")
 
-def apply_to_live_trader(scale, exponent, gamma, decorr_sec, live_trader_path):
+
+def apply_to_live_trader(scale, exponent, gamma, decorr_sec, live_trader_path, haircut_params=None):
     """Auto-update the constants in live_trader.py."""
     print(f"\n{'=' * 65}")
     print(f"Applying to {live_trader_path}")
@@ -797,6 +1024,21 @@ def apply_to_live_trader(scale, exponent, gamma, decorr_sec, live_trader_path):
         changes += n
         print(f"  Updated compute_option_value() formula")
     
+    # === HAIRCUT CONSTANTS ===
+    if haircut_params:
+        hp = haircut_params
+        haircut_replacements = [
+            (r'HAIRCUT_SCALE = [\d.]+', f'HAIRCUT_SCALE = {hp["scale"]}'),
+            (r'HAIRCUT_TAU = [\d.]+', f'HAIRCUT_TAU = {hp["tau"]:.0f}'),
+            (r'HAIRCUT_MARGIN_DECAY = [\d.]+', f'HAIRCUT_MARGIN_DECAY = {hp["decay"]}'),
+        ]
+        for pattern, replacement in haircut_replacements:
+            new_content, n = re.subn(pattern, replacement, content)
+            if n > 0:
+                content = new_content
+                changes += n
+        print(f"  Updated haircut constants: SCALE={hp['scale']}, TAU={hp['tau']:.0f}, DECAY={hp['decay']}")
+    
     if changes > 0:
         with open(live_trader_path, 'w') as f:
             f.write(content)
@@ -831,7 +1073,6 @@ if __name__ == '__main__':
 
     # Step 2: Autocorrelation → DT
     dt, autocorrs = measure_autocorrelation(conn)
-    conn.close()
 
     # Step 3: Backward induction (conditional + flat for comparison)
     OV_cond, OV_flat, margins, n_steps, dt = run_backward_induction(
@@ -848,11 +1089,15 @@ if __name__ == '__main__':
     )
 
     # Step 5: Output
-    print_results(scale, exponent, gamma, decorr_sec, global_mean, global_std, rmse, n_snapshots, old_params)
+    # Step 6: Calibrate microstate haircut (needs conn still open)
+    haircut_params = calibrate_haircut(conn)
+    conn.close()
+
+    print_results(scale, exponent, gamma, decorr_sec, global_mean, global_std, rmse, n_snapshots, old_params, haircut_params)
 
     # Optional: auto-apply
     if args.apply:
         trader_path = args.trader_path
         if trader_path is None:
             trader_path = os.path.join(os.path.dirname(args.db), 'live_trader.py')
-        apply_to_live_trader(scale, exponent, gamma, decorr_sec, trader_path)
+        apply_to_live_trader(scale, exponent, gamma, decorr_sec, trader_path, haircut_params)
