@@ -393,7 +393,10 @@ class BacktestEngine:
         def evaluate_venue(odds_dict, venue_name):
             """
             Evaluate best opportunity for a single venue, comparing YES and NO contracts.
-            Exact copy of live_trader.py evaluate_venue (lines 3042-3176).
+            Exact copy of live_trader.py evaluate_venue.
+            
+            Edge is computed from mid-price (confidence gate), then net EV after fees
+            must also be positive (execution gate).
 
             Returns (side, edge, entry_price, spread, contract_type, venue_name) or None
             """
@@ -408,12 +411,9 @@ class BacktestEngine:
 
             best = None
 
-            # Time-dependent spread limit (line 2164-2167)
-            game_time = game.get('time_remaining_sec', 2400)
-            if game_time >= 1200:  # > 20:00
-                max_spread = 3
-            else:
-                max_spread = 2
+            # Hard spread safety cap — filters dead/illiquid markets
+            # Actual spread cost is handled by net EV check per venue
+            max_spread = 4
 
             # ===== CHECK HOME SIDE (bet on home winning) =====
             home_candidates = []
@@ -439,8 +439,10 @@ class BacktestEngine:
                 best_home = home_candidates[0]
 
                 entry_price = best_home['ask'] / 100.0
+                mid_price = (best_home['ask'] + best_home['bid']) / 200.0
                 spread = best_home['spread']
-                home_edge = our_home - entry_price
+                home_edge = our_home - mid_price  # Stage 1: confidence from mid (venue-agnostic)
+                home_net_ev = calculate_net_ev(our_home, entry_price, spread, venue_name)  # Stage 2: capturable after fees+spread?
 
                 cooldown_key = (game_id, 'home')
                 in_cooldown = False
@@ -448,9 +450,10 @@ class BacktestEngine:
                     exit_game_time, cooldown_secs = self.exit_cooldowns[cooldown_key]
                     in_cooldown = (exit_game_time - time_remaining) < cooldown_secs
 
-                required_edge = get_required_edge(entry_price, time_remaining, e_start=self.min_edge)
+                required_edge = get_required_edge(mid_price, time_remaining, e_start=self.min_edge)
 
                 if (home_edge >= required_edge and
+                        home_net_ev > 0 and
                         spread <= max_spread and
                         entry_price >= MIN_ENTRY_PRICE and
                         entry_price <= MAX_ENTRY_PRICE and
@@ -483,8 +486,10 @@ class BacktestEngine:
                 best_away = away_candidates[0]
 
                 entry_price = best_away['ask'] / 100.0
+                mid_price = (best_away['ask'] + best_away['bid']) / 200.0
                 spread = best_away['spread']
-                away_edge = (1 - our_home) - entry_price
+                away_edge = (1 - our_home) - mid_price  # Stage 1: confidence from mid (venue-agnostic)
+                away_net_ev = calculate_net_ev(1 - our_home, entry_price, spread, venue_name)  # Stage 2: capturable?
 
                 cooldown_key = (game_id, 'away')
                 in_cooldown = False
@@ -492,9 +497,10 @@ class BacktestEngine:
                     exit_game_time, cooldown_secs = self.exit_cooldowns[cooldown_key]
                     in_cooldown = (exit_game_time - time_remaining) < cooldown_secs
 
-                required_edge = get_required_edge(entry_price, time_remaining, e_start=self.min_edge)
+                required_edge = get_required_edge(mid_price, time_remaining, e_start=self.min_edge)
 
                 if (away_edge >= required_edge and
+                        away_net_ev > 0 and
                         spread <= max_spread and
                         entry_price >= MIN_ENTRY_PRICE and
                         entry_price <= MAX_ENTRY_PRICE and
@@ -514,6 +520,7 @@ class BacktestEngine:
 
         # Evaluate Polymarket (skip if venue is kalshi-only)
         poly_best = None
+        poly_odds = None
         if self.venue in ('polymarket', 'best') and odds.get('has_polymarket'):
             poly_odds = {
                 'home_yes_bid': odds.get('poly_home_bid'),
@@ -527,7 +534,37 @@ class BacktestEngine:
             poly_best = evaluate_venue(poly_odds, 'Polymarket')
 
         # Pick the venue with better net EV after fees
+        # Alpha on EITHER venue means we trade — route to best net EV
         best = None
+
+        def get_venue_pricing(odds_dict, side, venue_name):
+            """Extract best contract pricing for a given side from raw odds."""
+            if side == 'home':
+                candidates = []
+                ha, hb = odds_dict.get('home_yes_ask', 0), odds_dict.get('home_yes_bid', 0)
+                if ha and hb:
+                    candidates.append(('home_yes', ha, hb, ha - hb))
+                na, nb = odds_dict.get('away_no_ask', 0), odds_dict.get('away_no_bid', 0)
+                if na and nb:
+                    candidates.append(('away_no', na, nb, na - nb))
+                if candidates:
+                    candidates.sort(key=lambda x: (x[1], x[3]))  # cheapest ask, then tightest spread
+                    ct, ask, bid, spd = candidates[0]
+                    return (side, our_home - (ask + bid) / 200.0, ask / 100.0, spd, ct, venue_name)
+            else:
+                candidates = []
+                aa, ab = odds_dict.get('away_yes_ask', 0), odds_dict.get('away_yes_bid', 0)
+                if aa and ab:
+                    candidates.append(('away_yes', aa, ab, aa - ab))
+                na, nb = odds_dict.get('home_no_ask', 0), odds_dict.get('home_no_bid', 0)
+                if na and nb:
+                    candidates.append(('home_no', na, nb, na - nb))
+                if candidates:
+                    candidates.sort(key=lambda x: (x[1], x[3]))
+                    ct, ask, bid, spd = candidates[0]
+                    return (side, (1 - our_home) - (ask + bid) / 200.0, ask / 100.0, spd, ct, venue_name)
+            return None
+
         if kalshi_best and poly_best:
             k_side, k_edge, k_price, k_spread = kalshi_best[0], kalshi_best[1], kalshi_best[2], kalshi_best[3]
             p_side, p_edge, p_price, p_spread = poly_best[0], poly_best[1], poly_best[2], poly_best[3]
@@ -545,8 +582,40 @@ class BacktestEngine:
                 best = poly_best
             else:
                 best = kalshi_best
+        elif kalshi_best and not poly_best and odds.get('has_polymarket') and poly_odds:
+            # Alpha confirmed on Kalshi — check if Poly is a better execution venue for the same side
+            poly_fallback = get_venue_pricing(poly_odds, kalshi_best[0], 'Polymarket')
+            if poly_fallback and poly_fallback[3] <= 4:
+                k_side, k_edge, k_price, k_spread = kalshi_best[0], kalshi_best[1], kalshi_best[2], kalshi_best[3]
+                p_side, p_edge, p_price, p_spread = poly_fallback[0], poly_fallback[1], poly_fallback[2], poly_fallback[3]
+                k_prob = our_home if k_side == 'home' else 1 - our_home
+                p_prob = our_home if p_side == 'home' else 1 - our_home
+                k_net_ev = calculate_net_ev(k_prob, k_price, k_spread, 'Kalshi')
+                p_net_ev = calculate_net_ev(p_prob, p_price, p_spread, 'Polymarket')
+                if p_net_ev > 0 and p_net_ev > k_net_ev:
+                    best = poly_fallback
+                else:
+                    best = kalshi_best
+            else:
+                best = kalshi_best
         elif kalshi_best:
             best = kalshi_best
+        elif poly_best and self.venue == 'best':
+            # Alpha confirmed on Poly — check if Kalshi is a better execution venue for the same side
+            kalshi_fallback = get_venue_pricing(odds, poly_best[0], 'Kalshi')
+            if kalshi_fallback and kalshi_fallback[3] <= 4:
+                p_side, p_edge, p_price, p_spread = poly_best[0], poly_best[1], poly_best[2], poly_best[3]
+                k_side, k_edge, k_price, k_spread = kalshi_fallback[0], kalshi_fallback[1], kalshi_fallback[2], kalshi_fallback[3]
+                p_prob = our_home if p_side == 'home' else 1 - our_home
+                k_prob = our_home if k_side == 'home' else 1 - our_home
+                p_net_ev = calculate_net_ev(p_prob, p_price, p_spread, 'Polymarket')
+                k_net_ev = calculate_net_ev(k_prob, k_price, k_spread, 'Kalshi')
+                if k_net_ev > 0 and k_net_ev > p_net_ev:
+                    best = kalshi_fallback
+                else:
+                    best = poly_best
+            else:
+                best = poly_best
         elif poly_best:
             best = poly_best
 
@@ -943,8 +1012,8 @@ class BacktestEngine:
         print(f"  Score freshness guard: {MAX_ESPN_SCORE_STALE_SEC}s")
         print(f"  Venue: {self.venue}")
         e_start = self.min_edge if self.min_edge is not None else 0.08
-        print(f"  Edge: {get_required_edge(0.5, 2400, e_start=self.min_edge)*100:.0f}% pregame -> {get_required_edge(0.5, 240, e_start=self.min_edge)*100:.0f}% @ 4:00")
-        print(f"  Spread: <=3c early, <=2c late | Price: {MIN_ENTRY_PRICE*100:.0f}-{MAX_ENTRY_PRICE*100:.0f}c")
+        print(f"  Edge: {get_required_edge(0.5, 2400, e_start=self.min_edge)*100:.0f}% (vs mid) pregame -> {get_required_edge(0.5, 240, e_start=self.min_edge)*100:.0f}% @ 4:00 | Net EV > 0 required")
+        print(f"  Spread: <=4c (net EV handles actual spread cost) | Price: {MIN_ENTRY_PRICE*100:.0f}-{MAX_ENTRY_PRICE*100:.0f}c")
         print(f"  OV: {OV_SCALE} x N^{OV_EXPONENT} x (1 + {OV_PROB_COEFF}*p*(1-p))")
         print(f"  Cooldown: {COOLDOWN_AFTER_EXIT}s game-time after exit")
         if self.min_edge is not None:

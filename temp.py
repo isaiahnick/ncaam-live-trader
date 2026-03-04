@@ -58,7 +58,6 @@ import math
 import sys
 import os
 import shutil
-import re
 import numpy as np
 
 # ===== LIVE TRADING IMPORT =====
@@ -606,7 +605,6 @@ TEAM_NAME_MAP = {
     "fresno st": "fresno st",
     "georgia st": "georgia st",
     "grambling st": "grambling st",
-    "grambling state": "grambling st",
     "idaho st": "idaho st",
     "illinois st": "illinois st",
     "indiana st": "indiana st",
@@ -783,11 +781,11 @@ def fetch_kalshi_odds() -> dict:
             print(f" error: {e}")
             break
     
-    # (intermediate progress suppressed)
+    print(f" {len(all_markets)} total...", end='', flush=True)
     
     # Filter to today's markets
     today_markets = [m for m in all_markets if today_str in m.get('ticker', '')]
-    # (intermediate progress suppressed)
+    print(f" {len(today_markets)} today...", end='', flush=True)
     
     # Group by event stem
     events = {}
@@ -796,7 +794,7 @@ def fetch_kalshi_odds() -> dict:
         stem = ticker.rsplit('-', 1)[0]  # Remove team suffix
         events.setdefault(stem, []).append(m)
     
-    # (intermediate progress suppressed)
+    print(f" {len(events)} games...", end='', flush=True)
     
     odds = {}
     matched = 0
@@ -927,17 +925,14 @@ def fetch_polymarket_odds(poly_client) -> dict:
     
     # Filter to today's events by slug date
     today_events = [e for e in ev_list if today_str in e.get('slug', '')]
-    # (intermediate progress suppressed)
+    print(f" {len(today_events)} today...", end='', flush=True)
     
     odds = {}
     matched = 0
     
     for ev in today_events:
         title = ev.get('title', '')
-        slug = ev.get('markets', [{}])[0].get('slug', ev.get('slug', ''))
-        
-        # Strip trailing date suffix (e.g., "2026-02-23") from title
-        title = re.sub(r'\s+\d{4}-\d{2}-\d{2}$', '', title)
+        slug = ev.get('slug', '')
         
         if ' vs. ' not in title:
             continue
@@ -1208,7 +1203,7 @@ class PaperTrader:
     
     # Entry parameters (OPTIMIZED 2026-02-02 via 3-day backtest)
     EDGE_THRESHOLD = 0.10  # 10% edge to trigger entry
-    MAX_SPREAD_CENTS = 4   # Safety cap — filters dead/illiquid markets (net EV handles actual spread cost)
+    MAX_SPREAD_CENTS = 3   # Only trade tight spreads (was 4¢)
     MIN_TIME_REMAINING = 240  # Don't enter with less than 4 minutes remaining
     MIN_ENTRY_PRICE = 0.10   # Don't enter below 10¢
     MAX_ENTRY_PRICE = 0.90   # Don't enter above 90¢
@@ -1514,9 +1509,17 @@ class PaperTrader:
         
         for row in cursor.fetchall():
             game_id, win_prob, team_a_id, team_b_id, team_a_home = row
+            # team_a_win_prob is from team_a's perspective
+            # We need home team's perspective for live tracking
+            if team_a_home == 1:
+                # team_a is home, so team_a_win_prob = home_prob
+                home_prob = win_prob
+            else:
+                # team_a is away, so home_prob = 1 - team_a_win_prob
+                home_prob = 1 - win_prob if win_prob else None
             
             self.predictions[str(game_id)] = {
-                'team_a_win_prob': win_prob,
+                'pregame_home_prob': home_prob,
                 'team_a_id': str(team_a_id),
                 'team_b_id': str(team_b_id),
                 'team_a_home': team_a_home
@@ -1526,21 +1529,14 @@ class PaperTrader:
     
     def _load_kalshi_odds(self):
         """Load current Kalshi odds for today's games"""
-        new_odds = fetch_kalshi_odds()
-        if new_odds:
-            self.kalshi_odds = new_odds
-            print(f"✓ Loaded {len(self.kalshi_odds) // 2} Kalshi markets")
-        else:
-            print(f"  ⚠️ Kalshi REST returned empty — keeping {len(self.kalshi_odds) // 2} cached markets")
+        self.kalshi_odds = fetch_kalshi_odds()
+        print(f"✓ Loaded {len(self.kalshi_odds) // 2} Kalshi markets")  # div 2 because indexed by both teams
     
     def _load_polymarket_odds(self):
         """Load current Polymarket odds for today's games"""
-        new_odds = fetch_polymarket_odds(self.poly_client)
-        if new_odds:
-            self.polymarket_odds = new_odds
+        self.polymarket_odds = fetch_polymarket_odds(self.poly_client)
+        if self.polymarket_odds:
             print(f"✓ Loaded {len(self.polymarket_odds) // 2} Polymarket markets")
-        else:
-            print(f"  ⚠️ Polymarket REST returned empty — keeping {len(self.polymarket_odds) // 2} cached markets")
     
     def _load_open_positions(self):
         """Load open positions - uses venue APIs as source of truth in live mode.
@@ -1600,7 +1596,7 @@ class PaperTrader:
             
             # Find the kalshi_odds entry for this ticker
             if ticker not in ticker_to_odds:
-                # Unknown ticker - no matching market
+                print(f"  ⚠️ Unknown ticker (no matching market): {ticker}")
                 skipped += 1
                 continue
             
@@ -1655,7 +1651,7 @@ class PaperTrader:
             if not game_id:
                 # Use ticker as fallback key - will match later when ESPN data comes in
                 game_id = f"kalshi:{ticker}"
-                # Will resolve when ESPN data comes in
+                print(f"  ⚠️ No game_id found for {away_team} @ {home_team}, using ticker key")
             
             # Track by event stem for duplicate detection
             if event_stem:
@@ -1846,7 +1842,7 @@ class PaperTrader:
             game_id = self._find_game_id_for_teams(poly_home, poly_away)
             if not game_id:
                 game_id = f"poly:{slug}"
-                # Will resolve when ESPN data comes in
+                print(f"  ⚠️ No game_id found for {poly_away} @ {poly_home}, using slug key")
             
             # Check if this game already has a Kalshi position
             if game_id in self.open_positions:
@@ -2073,6 +2069,7 @@ class PaperTrader:
             
             if matched:
                 if pos_key != game_id:
+                    print(f"  ℹ️ Matched position {pos_key} -> {game_id}")
                     self.open_positions[game_id] = self.open_positions.pop(pos_key)
                 return game_id
         
@@ -2429,8 +2426,7 @@ class PaperTrader:
                     'away_prob': best_match['away_prob'],
                     'title': best_match['title'],
                     'slug': best_match['slug'],
-                    'source': 'Polymarket',
-                    'poly_flipped': False
+                    'source': 'Polymarket'
                 }
             else:
                 # Poly away = ESPN home → swap prices
@@ -2446,8 +2442,7 @@ class PaperTrader:
                     'away_prob': best_match['home_prob'],
                     'title': best_match['title'],
                     'slug': best_match['slug'],
-                    'source': 'Polymarket',
-                    'poly_flipped': True
+                    'source': 'Polymarket'
                 }
         
         return None
@@ -2571,21 +2566,14 @@ class PaperTrader:
                 self._poly_ws_subscribe(slug)
                 ws_prices = self.poly_ws_book.get_prices(slug)
                 if ws_prices and ws_prices.get('away_bid') is not None:
-                    # WS prices are in Poly-native ordering — swap if flipped
-                    if poly.get('poly_flipped'):
-                        h_bid, h_ask = ws_prices['away_bid'], ws_prices['away_ask']
-                        a_bid, a_ask = ws_prices['home_bid'], ws_prices['home_ask']
-                    else:
-                        h_bid, h_ask = ws_prices['home_bid'], ws_prices['home_ask']
-                        a_bid, a_ask = ws_prices['away_bid'], ws_prices['away_ask']
-                    poly['home_yes_bid'] = h_bid
-                    poly['home_yes_ask'] = h_ask
-                    poly['away_yes_bid'] = a_bid
-                    poly['away_yes_ask'] = a_ask
-                    poly['poly_home_bid'] = h_bid
-                    poly['poly_home_ask'] = h_ask
-                    poly['poly_away_bid'] = a_bid
-                    poly['poly_away_ask'] = a_ask
+                    poly['home_yes_bid'] = ws_prices['home_bid']
+                    poly['home_yes_ask'] = ws_prices['home_ask']
+                    poly['away_yes_bid'] = ws_prices['away_bid']
+                    poly['away_yes_ask'] = ws_prices['away_ask']
+                    poly['poly_home_bid'] = ws_prices['home_bid']
+                    poly['poly_home_ask'] = ws_prices['home_ask']
+                    poly['poly_away_bid'] = ws_prices['away_bid']
+                    poly['poly_away_ask'] = ws_prices['away_ask']
                     poly['data_source'] = 'websocket'
                     poly['ws_age_ms'] = ws_prices['age_ms']
             
@@ -2637,7 +2625,6 @@ class PaperTrader:
             kalshi['poly_away_bid'] = poly['away_yes_bid']
             kalshi['poly_away_ask'] = poly['away_yes_ask']
             kalshi['poly_slug'] = poly.get('slug')
-            kalshi['poly_flipped'] = poly.get('poly_flipped', False)
             
             # If Polymarket WS available, override REST with fresher prices
             slug = poly.get('slug')
@@ -2645,17 +2632,10 @@ class PaperTrader:
                 self._poly_ws_subscribe(slug)
                 ws_prices = self.poly_ws_book.get_prices(slug)
                 if ws_prices and ws_prices.get('away_bid') is not None:
-                    # WS prices are in Poly-native ordering — swap if flipped
-                    if poly.get('poly_flipped'):
-                        kalshi['poly_home_bid'] = ws_prices['away_bid']
-                        kalshi['poly_home_ask'] = ws_prices['away_ask']
-                        kalshi['poly_away_bid'] = ws_prices['home_bid']
-                        kalshi['poly_away_ask'] = ws_prices['home_ask']
-                    else:
-                        kalshi['poly_away_bid'] = ws_prices['away_bid']
-                        kalshi['poly_away_ask'] = ws_prices['away_ask']
-                        kalshi['poly_home_bid'] = ws_prices['home_bid']
-                        kalshi['poly_home_ask'] = ws_prices['home_ask']
+                    kalshi['poly_away_bid'] = ws_prices['away_bid']
+                    kalshi['poly_away_ask'] = ws_prices['away_ask']
+                    kalshi['poly_home_bid'] = ws_prices['home_bid']
+                    kalshi['poly_home_ask'] = ws_prices['home_ask']
                     kalshi['poly_data_source'] = 'websocket'
                     kalshi['poly_ws_age_ms'] = ws_prices['age_ms']
                 else:
@@ -2817,30 +2797,29 @@ class PaperTrader:
         # Add predictions if we have them
         pred = self.predictions.get(game_id)
         if pred:
-            team_a_prob = pred['team_a_win_prob']
-            
-            # Match by team ID — unambiguous, works for neutral sites
-            if game['home_team_id'] == pred['team_a_id']:
-                home_prob = team_a_prob
-            elif game['home_team_id'] == pred['team_b_id']:
-                home_prob = 1 - team_a_prob if team_a_prob else None
-            elif game['away_team_id'] == pred['team_a_id']:
-                home_prob = 1 - team_a_prob if team_a_prob else None
-            elif game['away_team_id'] == pred['team_b_id']:
-                home_prob = team_a_prob
+            # Verify team alignment — ESPN and predictions may disagree
+            # on home/away for neutral site games. If so, flip ESPN to match.
+            if pred['team_a_home'] == 1:
+                pred_home_id = pred['team_a_id']
             else:
-                home_prob = None
+                pred_home_id = pred['team_b_id']
             
-            if home_prob is not None:
-                game['pregame_home_prob'] = home_prob
-                
-                if state == 'in':
-                    score_diff = home_score - away_score
-                    live_prob = self.model.calculate_win_probability(
-                        home_prob, score_diff, time_remaining
-                    )
-                    game['live_home_prob'] = live_prob
-                    game['prob_change'] = live_prob - home_prob
+            if game['home_team_id'] != pred_home_id:
+                # ESPN has teams flipped vs predictions — swap everything
+                game['home_team'], game['away_team'] = game['away_team'], game['home_team']
+                game['home_team_id'], game['away_team_id'] = game['away_team_id'], game['home_team_id']
+                game['home_score'], game['away_score'] = game['away_score'], game['home_score']
+                home_score, away_score = game['home_score'], game['away_score']
+            
+            game['pregame_home_prob'] = pred['pregame_home_prob']
+            
+            if state == 'in':
+                score_diff = home_score - away_score
+                live_prob = self.model.calculate_win_probability(
+                    pred['pregame_home_prob'], score_diff, time_remaining
+                )
+                game['live_home_prob'] = live_prob
+                game['prob_change'] = live_prob - pred['pregame_home_prob']
         
         return game
     
@@ -3054,9 +3033,9 @@ class PaperTrader:
             
             if poly_age_ms is not None:
                 if time_remaining > 480:
-                    MAX_POLY_STALE_MS = 120000  # 120 seconds
+                    MAX_POLY_STALE_MS = 10000  # 10 seconds (Poly WS can be slower)
                 else:
-                    MAX_POLY_STALE_MS = 60000  # 60 seconds late game
+                    MAX_POLY_STALE_MS = 6000  # 6 seconds late game
                 
                 if poly_age_ms > MAX_POLY_STALE_MS:
                     # Poly data stale — only block Poly venue, not Kalshi
@@ -3111,9 +3090,12 @@ class PaperTrader:
             
             best = None
             
-            # Hard spread safety cap — filters dead/illiquid markets
-            # Actual spread cost is handled by net EV check per venue
-            max_spread = 4
+            # Time-dependent spread limit: more lenient early, stricter late
+            game_time = game.get('time_remaining_sec', 2400)
+            if game_time >= 1200:  # > 20:00
+                max_spread = 3  # Early game: allow 3¢ spreads
+            else:
+                max_spread = 2  # Late game: allow 2¢ spreads
             
             # ===== CHECK HOME SIDE (bet on home team winning) =====
             # Option A: Buy HOME YES @ home_yes_ask, exit at home_yes_bid
@@ -3144,10 +3126,8 @@ class PaperTrader:
                 best_home = home_candidates[0]
                 
                 entry_price = best_home['ask'] / 100.0
-                mid_price = (best_home['ask'] + best_home['bid']) / 200.0
                 spread = best_home['spread']
-                home_edge = our_home - mid_price  # Stage 1: confidence from mid (venue-agnostic)
-                home_net_ev = calculate_net_ev(our_home, entry_price, spread, venue_name)  # Stage 2: capturable after fees+spread?
+                home_edge = our_home - entry_price
                 
                 cooldown_key = (game_id, 'home')
                 in_cooldown = False
@@ -3157,10 +3137,9 @@ class PaperTrader:
                     in_cooldown = (exit_game_time - current_game_time) < cooldown_secs
                 
                 time_remaining = game.get('time_remaining_sec', 2400)
-                required_edge = self.get_required_edge(mid_price, time_remaining)
+                required_edge = self.get_required_edge(entry_price, time_remaining)
                 
                 if (home_edge >= required_edge and 
-                    home_net_ev > 0 and
                     spread <= max_spread and
                     entry_price >= self.MIN_ENTRY_PRICE and
                     entry_price <= self.MAX_ENTRY_PRICE and
@@ -3198,10 +3177,8 @@ class PaperTrader:
                 best_away = away_candidates[0]
                 
                 entry_price = best_away['ask'] / 100.0
-                mid_price = (best_away['ask'] + best_away['bid']) / 200.0
                 spread = best_away['spread']
-                away_edge = (1 - our_home) - mid_price  # Stage 1: confidence from mid (venue-agnostic)
-                away_net_ev = calculate_net_ev(1 - our_home, entry_price, spread, venue_name)  # Stage 2: capturable?
+                away_edge = (1 - our_home) - entry_price
                 
                 cooldown_key = (game_id, 'away')
                 in_cooldown = False
@@ -3211,10 +3188,9 @@ class PaperTrader:
                     in_cooldown = (exit_game_time - current_game_time) < cooldown_secs
                 
                 time_remaining = game.get('time_remaining_sec', 2400)
-                required_edge = self.get_required_edge(mid_price, time_remaining)
+                required_edge = self.get_required_edge(entry_price, time_remaining)
                 
                 if (away_edge >= required_edge and 
-                    away_net_ev > 0 and
                     spread <= max_spread and
                     entry_price >= self.MIN_ENTRY_PRICE and
                     entry_price <= self.MAX_ENTRY_PRICE and
@@ -3237,7 +3213,6 @@ class PaperTrader:
         
         # Evaluate Polymarket (skip if venue is kalshi-only)
         poly_best = None
-        poly_odds = None
         if self.venue in ('polymarket', 'best'):
             if kalshi_odds.get('has_polymarket'):
                 poly_odds = {
@@ -3255,37 +3230,7 @@ class PaperTrader:
                 poly_best = evaluate_venue(kalshi_odds, 'Polymarket')
         
         # Pick the venue with better net EV after fees
-        # Alpha on EITHER venue means we trade — route to best net EV
         best = None
-        
-        def get_venue_pricing(odds_dict, side, venue_name):
-            """Extract best contract pricing for a given side from raw odds."""
-            if side == 'home':
-                candidates = []
-                ha, hb = odds_dict.get('home_yes_ask', 0), odds_dict.get('home_yes_bid', 0)
-                if ha and hb:
-                    candidates.append(('home_yes', ha, hb, ha - hb, odds_dict.get('home_ticker')))
-                na, nb = odds_dict.get('away_no_ask', 0), odds_dict.get('away_no_bid', 0)
-                if na and nb:
-                    candidates.append(('away_no', na, nb, na - nb, odds_dict.get('away_ticker')))
-                if candidates:
-                    candidates.sort(key=lambda x: (x[1], x[3]))  # cheapest ask, then tightest spread
-                    ct, ask, bid, spd, tkr = candidates[0]
-                    return (side, our_home - (ask + bid) / 200.0, ask / 100.0, spd, tkr, venue_name, ct)
-            else:
-                candidates = []
-                aa, ab = odds_dict.get('away_yes_ask', 0), odds_dict.get('away_yes_bid', 0)
-                if aa and ab:
-                    candidates.append(('away_yes', aa, ab, aa - ab, odds_dict.get('away_ticker')))
-                na, nb = odds_dict.get('home_no_ask', 0), odds_dict.get('home_no_bid', 0)
-                if na and nb:
-                    candidates.append(('home_no', na, nb, na - nb, odds_dict.get('home_ticker')))
-                if candidates:
-                    candidates.sort(key=lambda x: (x[1], x[3]))
-                    ct, ask, bid, spd, tkr = candidates[0]
-                    return (side, (1 - our_home) - (ask + bid) / 200.0, ask / 100.0, spd, tkr, venue_name, ct)
-            return None
-        
         if kalshi_best and poly_best:
             k_side, k_edge, k_price, k_spread = kalshi_best[0], kalshi_best[1], kalshi_best[2], kalshi_best[3]
             p_side, p_edge, p_price, p_spread = poly_best[0], poly_best[1], poly_best[2], poly_best[3]
@@ -3307,80 +3252,19 @@ class PaperTrader:
                 best = (best[0], best[1], best[2], best[3], kalshi_odds.get('poly_slug'), 'Polymarket', best[6])
             else:
                 best = kalshi_best
-        elif kalshi_best and not poly_best and kalshi_odds.get('has_polymarket') and poly_odds:
-            # Alpha confirmed on Kalshi — check if Poly is a better execution venue for the same side
-            poly_fallback = get_venue_pricing(poly_odds, kalshi_best[0], 'Polymarket')
-            if poly_fallback and poly_fallback[3] <= self.MAX_SPREAD_CENTS:
-                k_side, k_edge, k_price, k_spread = kalshi_best[0], kalshi_best[1], kalshi_best[2], kalshi_best[3]
-                p_side, p_edge, p_price, p_spread = poly_fallback[0], poly_fallback[1], poly_fallback[2], poly_fallback[3]
-                k_prob = our_home if k_side == 'home' else 1 - our_home
-                p_prob = our_home if p_side == 'home' else 1 - our_home
-                k_net_ev = calculate_net_ev(k_prob, k_price, k_spread, 'Kalshi')
-                p_net_ev = calculate_net_ev(p_prob, p_price, p_spread, 'Polymarket')
-                
-                k_ct = kalshi_best[6]
-                p_ct = poly_fallback[6]
-                away_short = strip_mascot(game.get('away_team', ''))[:12]
-                home_short = strip_mascot(game.get('home_team', ''))[:12]
-                
-                if p_net_ev > 0 and p_net_ev > k_net_ev:
-                    winner = "POLY"
-                    print(f"  🔀 VENUE: {away_short}@{home_short} | K:{k_ct} {k_price*100:.0f}¢ spd={k_spread:.0f} ev={k_net_ev:.2f} | P:{p_ct} {p_price*100:.0f}¢ spd={p_spread:.0f} ev={p_net_ev:.2f} → {winner}")
-                    best = (poly_fallback[0], poly_fallback[1], poly_fallback[2], poly_fallback[3], kalshi_odds.get('poly_slug'), 'Polymarket', poly_fallback[6])
-                else:
-                    winner = "KALSHI"
-                    print(f"  🔀 VENUE: {away_short}@{home_short} | K:{k_ct} {k_price*100:.0f}¢ spd={k_spread:.0f} ev={k_net_ev:.2f} | P:{p_ct} {p_price*100:.0f}¢ spd={p_spread:.0f} ev={p_net_ev:.2f} → {winner}")
-                    best = kalshi_best
-            else:
-                best = kalshi_best
-                away_short = strip_mascot(game.get('away_team', ''))[:12]
-                home_short = strip_mascot(game.get('home_team', ''))[:12]
-                print(f"  🔀 VENUE: {away_short}@{home_short} | K-only ({kalshi_best[6]} {kalshi_best[2]*100:.0f}¢) | Poly=wide/no prices")
         elif kalshi_best:
             best = kalshi_best
             away_short = strip_mascot(game.get('away_team', ''))[:12]
             home_short = strip_mascot(game.get('home_team', ''))[:12]
-            print(f"  🔀 VENUE: {away_short}@{home_short} | K-only ({kalshi_best[6]} {kalshi_best[2]*100:.0f}¢) | Poly=no match")
-        elif poly_best and is_kalshi_primary and self.venue == 'best':
-            # Alpha confirmed on Poly — check if Kalshi is a better execution venue for the same side
-            kalshi_fallback = get_venue_pricing(kalshi_odds, poly_best[0], 'Kalshi')
-            if kalshi_fallback and kalshi_fallback[3] <= self.MAX_SPREAD_CENTS:
-                p_side, p_edge, p_price, p_spread = poly_best[0], poly_best[1], poly_best[2], poly_best[3]
-                k_side, k_edge, k_price, k_spread = kalshi_fallback[0], kalshi_fallback[1], kalshi_fallback[2], kalshi_fallback[3]
-                p_prob = our_home if p_side == 'home' else 1 - our_home
-                k_prob = our_home if k_side == 'home' else 1 - our_home
-                p_net_ev = calculate_net_ev(p_prob, p_price, p_spread, 'Polymarket')
-                k_net_ev = calculate_net_ev(k_prob, k_price, k_spread, 'Kalshi')
-                
-                p_ct = poly_best[6]
-                k_ct = kalshi_fallback[6]
-                away_short = strip_mascot(game.get('away_team', ''))[:12]
-                home_short = strip_mascot(game.get('home_team', ''))[:12]
-                
-                if k_net_ev > 0 and k_net_ev > p_net_ev:
-                    winner = "KALSHI"
-                    print(f"  🔀 VENUE: {away_short}@{home_short} | K:{k_ct} {k_price*100:.0f}¢ spd={k_spread:.0f} ev={k_net_ev:.2f} | P:{p_ct} {p_price*100:.0f}¢ spd={p_spread:.0f} ev={p_net_ev:.2f} → {winner}")
-                    best = kalshi_fallback
-                else:
-                    winner = "POLY"
-                    print(f"  🔀 VENUE: {away_short}@{home_short} | K:{k_ct} {k_price*100:.0f}¢ spd={k_spread:.0f} ev={k_net_ev:.2f} | P:{p_ct} {p_price*100:.0f}¢ spd={p_spread:.0f} ev={p_net_ev:.2f} → {winner}")
-                    best = poly_best
-                    slug = kalshi_odds.get('poly_slug') or kalshi_odds.get('slug')
-                    best = (best[0], best[1], best[2], best[3], slug, 'Polymarket', best[6])
-            else:
-                best = poly_best
-                slug = kalshi_odds.get('poly_slug') or kalshi_odds.get('slug')
-                best = (best[0], best[1], best[2], best[3], slug, 'Polymarket', best[6])
-                away_short = strip_mascot(game.get('away_team', ''))[:12]
-                home_short = strip_mascot(game.get('home_team', ''))[:12]
-                print(f"  🔀 VENUE: {away_short}@{home_short} | P-only ({poly_best[6]} {poly_best[2]*100:.0f}¢) | Kalshi=wide/no prices")
+            has_poly = kalshi_odds.get('has_polymarket', False)
+            print(f"  🔀 VENUE: {away_short}@{home_short} | K-only ({kalshi_best[6]} {kalshi_best[2]*100:.0f}¢) | Poly={'no match' if not has_poly else 'no edge'}")
         elif poly_best:
             best = poly_best
             slug = kalshi_odds.get('poly_slug') or kalshi_odds.get('slug')
             best = (best[0], best[1], best[2], best[3], slug, 'Polymarket', best[6])
             away_short = strip_mascot(game.get('away_team', ''))[:12]
             home_short = strip_mascot(game.get('home_team', ''))[:12]
-            print(f"  🔀 VENUE: {away_short}@{home_short} | P-only ({poly_best[6]} {poly_best[2]*100:.0f}¢) | Kalshi=no match")
+            print(f"  🔀 VENUE: {away_short}@{home_short} | P-only ({poly_best[6]} {poly_best[2]*100:.0f}¢) | Kalshi={'no match' if not is_kalshi_primary else 'no edge'}")
         
         if not best:
             # No opportunity - clear any pending confirmation for this game
@@ -3451,8 +3335,7 @@ class PaperTrader:
             'our_prob': our_prob,
             'status': status,
             'market_source': market_source,  # Track which venue we're entering on
-            'contract_type': contract_type,  # Track which contract: home_yes, away_no, away_yes, home_no
-            'poly_flipped': kalshi_odds.get('poly_flipped', False)
+            'contract_type': contract_type   # Track which contract: home_yes, away_no, away_yes, home_no
         }
     
     def log_opportunity(self, opp: dict, trade_type: str = 'ENTRY'):
@@ -3510,10 +3393,6 @@ class PaperTrader:
         game_status = game.get('status', 'in')
         market_source = position.get('market_source', 'Kalshi')
         contract_type = position.get('contract_type', f'{side}_yes')
-        
-        # Backfill poly_flipped for positions loaded from API on restart
-        if market_source == 'Polymarket' and 'poly_flipped' not in position:
-            position['poly_flipped'] = kalshi_odds.get('poly_flipped', False)
         
         # Get scores and time
         home_score = game.get('home_score', 0)
@@ -3853,20 +3732,17 @@ class PaperTrader:
                 else:
                     sell_intent = 'ORDER_INTENT_SELL_SHORT'
                 
-                # Neutral site fix: if Poly orientation was flipped at entry, invert
-                if position.get('poly_flipped'):
-                    sell_intent = 'ORDER_INTENT_SELL_SHORT' if sell_intent == 'ORDER_INTENT_SELL_LONG' else 'ORDER_INTENT_SELL_LONG'
-                
                 EXIT_PRICE_BUFFER_CENTS = 3
                 home_exit_cents = exit_info['exit_price'] * 100
                 
-                if sell_intent == 'ORDER_INTENT_SELL_LONG':
-                    # SELL_LONG: selling outcome token, price = sell floor, lower = more aggressive
+                if 'away' in contract_type:
+                    # SELL_LONG: selling away token, price = sell floor, lower = more aggressive
                     raw_price_cents = home_exit_cents
                     price_cents = max(1, raw_price_cents - EXIT_PRICE_BUFFER_CENTS)
                 else:
-                    # SELL_SHORT: SDK sends BUY on outcome token to close short
-                    # Complement price
+                    # SELL_SHORT: SDK sends BUY on away token to close short
+                    # Complement price: home bid 60¢ → buy away at 40¢ ceiling
+                    # Higher ceiling = more aggressive for buys
                     raw_price_cents = 100 - home_exit_cents
                     price_cents = min(99, raw_price_cents + EXIT_PRICE_BUFFER_CENTS)
                 
@@ -4032,7 +3908,7 @@ class PaperTrader:
         print("\n" + "═"*_sw)
         print("  📈 LIVE TRADER │ Dual-Venue Market Trading")
         print("═"*_sw)
-        print(f"  Entry: 8%→15% edge from mid (exp k=2) + net EV>0 │ Spread cap: 4¢")
+        print(f"  Entry: 5%→15% edge (exp k=2) │ Spread: 3¢/2¢")
         print(f"  Exit: EV-based (OV={self.OV_SCALE}×N^{self.OV_EXPONENT}) │ Cooldown: {self.COOLDOWN_AFTER_EXIT}s game-time")
         print(f"  Haircut: k={self.HAIRCUT_K} × H(t,|m|), ramp {self.HAIRCUT_RAMP_HI//60}:{self.HAIRCUT_RAMP_HI%60:02d}→{self.HAIRCUT_RAMP_LO//60}:{self.HAIRCUT_RAMP_LO%60:02d}, |m|≤{self.HAIRCUT_MARGIN_MAX}")
         ws_str = "WS" if KALSHI_WS_AVAILABLE else "REST"
@@ -4053,12 +3929,42 @@ class PaperTrader:
                 # Clear just_exited from previous tick
                 self.just_exited.clear()
                 
-                # Periodic WS resubscribe — fixes single-market silent drops
-                if cycle_number % 60 == 0:
-                    if self.use_poly_ws and self.poly_ws_book and self.poly_ws_book.connected:
-                        self.poly_ws_book.resubscribe_all()
-                    if self.use_ws and self.ws_book and self.ws_book.connected:
-                        self.ws_book.resubscribe_all()
+                # === WS HEALTH CHECK: Connection-level freshness ===
+                WS_DEAD_SEC = 15  # No messages at all in 15s = connection dead
+                
+                if self.use_ws and self.ws_book:
+                    age = time.time() - self.ws_book.last_any_message_ts if self.ws_book.last_any_message_ts > 0 else float('inf')
+                    if age > WS_DEAD_SEC:
+                        print(f"  🔄 Kalshi WS dead — no messages for {age:.0f}s — forcing reconnect...")
+                        try:
+                            self.ws_book.stop()
+                            time.sleep(1)
+                            self.ws_book.start()
+                            time.sleep(1)
+                            if self.ws_book.connected:
+                                print("  ✓ Kalshi WS reconnected")
+                                self._ws_subscribed_tickers.clear()
+                            else:
+                                print("  ⚠️ Kalshi WS reconnect failed — will retry next cycle")
+                        except Exception as e:
+                            print(f"  ⚠️ Kalshi WS restart error: {e}")
+                
+                if self.use_poly_ws and self.poly_ws_book:
+                    age = time.time() - self.poly_ws_book.last_any_message_ts if self.poly_ws_book.last_any_message_ts > 0 else float('inf')
+                    if age > WS_DEAD_SEC:
+                        print(f"  🔄 Poly WS dead — no messages for {age:.0f}s — forcing reconnect...")
+                        try:
+                            self.poly_ws_book.stop()
+                            time.sleep(1)
+                            self.poly_ws_book.start()
+                            time.sleep(1)
+                            if self.poly_ws_book.connected:
+                                print("  ✓ Poly WS reconnected")
+                                self._poly_ws_subscribed_slugs.clear()
+                            else:
+                                print("  ⚠️ Poly WS reconnect failed — will retry next cycle")
+                        except Exception as e:
+                            print(f"  ⚠️ Poly WS restart error: {e}")
                 
                 # Fetch all data in PARALLEL for lower latency
                 kalshi_portfolio = None
@@ -4067,19 +3973,13 @@ class PaperTrader:
                     futures = {
                         executor.submit(self.scan_games): 'espn',
                     }
-                    # Kalshi: use REST if WS is dead/stale, or every 10 min for new market discovery
-                    kalshi_ws_fresh = (time.time() - self.ws_book.last_any_message_ts < 15) if self.ws_book and self.ws_book.last_any_message_ts > 0 else False
-                    kalshi_ws_alive = self.use_ws and self.ws_book and self.ws_book.connected and kalshi_ws_fresh
+                    # Kalshi: use REST if WS is dead, or every 10 min for new market discovery
+                    kalshi_ws_alive = self.use_ws and self.ws_book and self.ws_book.connected
                     if not kalshi_ws_alive or cycle_number % 600 == 0:
-                        if self.use_ws and self.ws_book and self.ws_book.connected and not kalshi_ws_fresh:
-                            self.ws_book.force_reconnect()
                         futures[executor.submit(self._load_kalshi_odds)] = 'kalshi'
-                    # Polymarket: use REST if WS is dead/stale, or every 10 min for new market discovery
-                    poly_ws_fresh = (time.time() - self.poly_ws_book.last_any_message_ts < 15) if self.poly_ws_book and self.poly_ws_book.last_any_message_ts > 0 else False
-                    poly_ws_alive = self.use_poly_ws and self.poly_ws_book and self.poly_ws_book.connected and poly_ws_fresh
+                    # Polymarket: use REST if WS is dead, or every 10 min for new market discovery
+                    poly_ws_alive = self.use_poly_ws and self.poly_ws_book and self.poly_ws_book.connected
                     if self.poly_client and (not poly_ws_alive or cycle_number % 600 == 0):
-                        if self.use_poly_ws and self.poly_ws_book and self.poly_ws_book.connected and not poly_ws_fresh:
-                            self.poly_ws_book.force_reconnect()
                         futures[executor.submit(self._load_polymarket_odds)] = 'polymarket'
                     # Add portfolio fetches for live mode
                     if self.live_mode:
@@ -4298,6 +4198,7 @@ class PaperTrader:
                                                (espn_away_norm == kalshi_away or kalshi_away in espn_away_norm):
                                                 current_game = g
                                                 # Migrate the key
+                                                print(f"  ℹ️ Matched position {game_id} -> {g['game_id']}")
                                                 self.open_positions[g['game_id']] = self.open_positions.pop(game_id)
                                                 game_id = g['game_id']
                                                 break
@@ -4439,83 +4340,29 @@ class PaperTrader:
                             best_home_ask = min(home_asks) if home_asks else None
                             best_away_ask = min(away_asks) if away_asks else None
                             
-                            # Calculate edges from mid price per venue (not cross-venue synthetic mid)
-                            # Compute mid on each venue independently, pick the better edge
-                            
-                            # Kalshi bids
-                            k_home_yes_bid = odds.get('home_yes_bid')
-                            k_away_no_bid = odds.get('away_no_bid')
-                            k_away_yes_bid = odds.get('away_yes_bid')
-                            k_home_no_bid = odds.get('home_no_bid')
-                            
-                            # Poly bids
-                            p_home_bid = odds.get('poly_home_bid') if odds.get('has_polymarket') else None
-                            p_away_bid = odds.get('poly_away_bid') if odds.get('has_polymarket') else None
-                            
-                            # HOME side: compute mid per venue, take best edge
-                            home_edges = []
-                            if k_home_ask:
-                                k_home_bid = None
-                                if k_home_yes and k_away_no:
-                                    # Pick bid matching the best ask
-                                    if k_away_no < k_home_yes:
-                                        k_home_bid = k_away_no_bid
-                                    else:
-                                        k_home_bid = k_home_yes_bid
-                                elif k_home_yes:
-                                    k_home_bid = k_home_yes_bid
-                                elif k_away_no:
-                                    k_home_bid = k_away_no_bid
-                                if k_home_bid:
-                                    k_home_mid = (k_home_ask + k_home_bid) / 200.0
-                                    home_edges.append(our_home - k_home_mid)
-                            if p_home_ask and p_home_bid:
-                                p_home_mid = (p_home_ask + p_home_bid) / 200.0
-                                home_edges.append(our_home - p_home_mid)
-                            
-                            if home_edges:
-                                home_edge = max(home_edges)
+                            # Calculate edges from best ask
+                            if best_home_ask:
+                                home_edge = our_home - (best_home_ask / 100.0)
                                 if best_edge is None or home_edge > (best_edge or -999):
                                     best_edge = home_edge
                                     best_side = 'home'
-                            
-                            # AWAY side: compute mid per venue, take best edge
-                            away_edges = []
-                            if k_away_ask:
-                                k_away_bid = None
-                                if k_away_yes and k_home_no:
-                                    if k_home_no < k_away_yes:
-                                        k_away_bid = k_home_no_bid
-                                    else:
-                                        k_away_bid = k_away_yes_bid
-                                elif k_away_yes:
-                                    k_away_bid = k_away_yes_bid
-                                elif k_home_no:
-                                    k_away_bid = k_home_no_bid
-                                if k_away_bid:
-                                    k_away_mid = (k_away_ask + k_away_bid) / 200.0
-                                    away_edges.append((1 - our_home) - k_away_mid)
-                            if p_away_ask and p_away_bid:
-                                p_away_mid = (p_away_ask + p_away_bid) / 200.0
-                                away_edges.append((1 - our_home) - p_away_mid)
-                            
-                            if away_edges:
-                                away_edge = max(away_edges)
+                            if best_away_ask:
+                                away_edge = (1 - our_home) - (best_away_ask / 100.0)
                                 if best_edge is None or away_edge > (best_edge or -999):
                                     best_edge = away_edge
                                     best_side = 'away'
                             
                             # If no positive edge, show the better negative one
                             if best_edge is None:
-                                all_edges = []
-                                if home_edges:
-                                    all_edges.append((max(home_edges), 'home'))
-                                if away_edges:
-                                    all_edges.append((max(away_edges), 'away'))
-                                if all_edges:
-                                    all_edges.sort(key=lambda x: x[0], reverse=True)
-                                    best_edge = all_edges[0][0]
-                                    best_side = all_edges[0][1]
+                                if best_home_ask and best_away_ask:
+                                    home_e = our_home - (best_home_ask / 100.0)
+                                    away_e = (1 - our_home) - (best_away_ask / 100.0)
+                                    if home_e > away_e:
+                                        best_edge = home_e
+                                        best_side = 'home'
+                                    else:
+                                        best_edge = away_e
+                                        best_side = 'away'
                         
                         games_with_edge.append((game, odds, best_edge, best_side))
                     
@@ -4582,16 +4429,11 @@ class PaperTrader:
                             else:
                                 k_ask, k_bid = None, None
                             
-                            # Determine best venue by net EV and add star
+                            # Determine best ask across venues and add star
                             k_star = ""
                             p_star = ""
-                            if k_ask and k_bid and p_ask_raw and p_bid_raw:
-                                model_prob = game['live_home_prob'] if edge_side == 'home' else 1 - game['live_home_prob']
-                                k_spd = k_ask - k_bid
-                                p_spd = p_ask_raw - p_bid_raw
-                                k_nev = calculate_net_ev(model_prob, k_ask / 100.0, k_spd, 'Kalshi')
-                                p_nev = calculate_net_ev(model_prob, p_ask_raw / 100.0, p_spd, 'Polymarket')
-                                if k_nev >= p_nev:
+                            if k_ask and p_ask_raw:
+                                if k_ask <= p_ask_raw:
                                     k_star = "★"
                                 else:
                                     p_star = "★"
@@ -4901,9 +4743,7 @@ class PaperTrader:
                 price_cents = min(99, raw_price_cents + buffer)
                 
                 buf_str = f" (ask={raw_price_cents}¢ +{buffer}¢ buffer)" if buffer > 0 else ""
-                bet_team = opp['home_team'][:20] if side == 'home' else opp['away_team'][:20]
-                contract_label = contract_type.replace('_', ' ').upper()
-                print(f"\n  🔴 LIVE BUY: {bet_team} {contract_label} @ {price_cents}¢{buf_str} x {contracts_to_order} [Kalshi]")
+                print(f"\n  🔴 LIVE BUY: {ticker} {kalshi_side.value.upper()} @ {price_cents}¢ x {contracts_to_order}{buf_str}")
                 
                 try:
                     result = self.kalshi_client.place_order(
@@ -4988,10 +4828,6 @@ class PaperTrader:
                 else:
                     intent = 'ORDER_INTENT_BUY_SHORT'
                 
-                # Neutral site fix: if Poly's outcome team is ESPN's home, invert intent
-                if opp.get('poly_flipped'):
-                    intent = 'ORDER_INTENT_BUY_SHORT' if intent == 'ORDER_INTENT_BUY_LONG' else 'ORDER_INTENT_BUY_LONG'
-                
                 # Smart price walk-up (keep full float precision from BBO)
                 home_price_cents = entry_price * 100
                 time_remaining = opp.get('time_remaining_sec', 2400)
@@ -5004,26 +4840,24 @@ class PaperTrader:
                     if current_edge - 0.02 >= required_edge:
                         buffer = 2
                 
-                if intent == 'ORDER_INTENT_BUY_LONG':
-                    # BUY_LONG: buying outcome token, higher = more aggressive
+                if 'away' in contract_type:
+                    # BUY_LONG: price = away ask, higher = more aggressive
                     raw_price_cents = home_price_cents
                     price_cents = min(99, raw_price_cents + buffer)
                     buf_str = f" +{buffer}¢ buf" if buffer > 0 else ""
                 else:
-                    # BUY_SHORT: SDK sends SELL on outcome token
-                    # Must complement price
+                    # BUY_SHORT: SDK sends SELL on away token
+                    # Must complement price: home 55¢ → sell away at 45¢ floor
+                    # Lower floor = more aggressive for sells
                     raw_price_cents = 100 - home_price_cents
                     price_cents = max(1, raw_price_cents - buffer)
                 
                 price_decimal = price_cents / 100.0
                 bet_team = opp['home_team'][:20] if side == 'home' else opp['away_team'][:20]
-                contract_label = contract_type.replace('_', ' ').upper()
                 if intent == 'ORDER_INTENT_BUY_SHORT':
-                    buf_str = f" -{buffer}¢ buf" if buffer else ""
-                    print(f"\n  🟣 LIVE BUY: {bet_team} {contract_label} @ {home_price_cents:.0f}¢ (CLOB: sell @ {price_cents:.0f}¢{buf_str}) x {contracts_to_order} [Poly]")
+                    print(f"\n  🟣 POLY BUY SHORT: {bet_team} @ {home_price_cents:.1f}¢ (CLOB: sell away @ {price_cents:.1f}¢{f' -{buffer}¢ buf' if buffer else ''}) x {contracts_to_order}")
                 else:
-                    buf_str = f" +{buffer}¢ buf" if buffer else ""
-                    print(f"\n  🟣 LIVE BUY: {bet_team} {contract_label} @ {price_cents:.0f}¢{f' ({buf_str.strip()})' if buffer else ''} x {contracts_to_order} [Poly]")
+                    print(f"\n  🟣 POLY BUY LONG: {bet_team} @ {price_cents:.1f}¢{f' (+{buffer}¢ buf)' if buffer else ''} x {contracts_to_order}")
                 
                 try:
                     result = self.poly_client.orders.create({
@@ -5038,12 +4872,13 @@ class PaperTrader:
                     # SDK returns 'executions' not 'fills'
                     fills = result.get('executions', []) or result.get('fills', [])
                     if fills:
-                        pass  # Debug: fills[0] keys available if needed
+                        print(f"  📋 Execution[0] keys: {list(fills[0].keys()) if isinstance(fills[0], dict) else type(fills[0])}")
                     fill_count = sum(int(float(f.get('quantity', 0))) if isinstance(f.get('quantity', 0), str) else f.get('quantity', 0) for f in fills)
                     poly_pos = None  # Will be populated if needed
                     
                     # Fallback: check positions API if no fills parsed
                     if fill_count == 0:
+                        print(f"  📋 Order response keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
                         # Check for alternative fill indicators
                         status_str = result.get('status', '') if isinstance(result, dict) else ''
                         qty_filled = result.get('quantityFilled') or result.get('filledQuantity') or result.get('filled_quantity')
@@ -5125,7 +4960,6 @@ class PaperTrader:
                 'market_ticker': opp.get('market_ticker'),
                 'market_source': market_source,  # Track which venue we entered on
                 'contract_type': contract_type,   # Track which contract: home_yes, away_no, etc.
-                'poly_flipped': opp.get('poly_flipped', False),
                 # Live trading fields
                 'live_fill_count': live_fill_count,
                 'live_avg_price': live_avg_price,

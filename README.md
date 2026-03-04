@@ -114,7 +114,7 @@ The option's value depends on how much the market bounces around. If Kalshi's bi
 
 But markets are noisy. Sometimes the bid sits above model fair value, and you can sell at a profit.
 
-I measured this empirically using 930,000+ in-game snapshots, capturing the bid price and model probability every second:
+I measured this empirically using 2,800,000+ in-game snapshots, capturing the bid price and model probability every second:
 
 ```
 residual = kalshi_bid - (model_probability × 100)
@@ -126,20 +126,20 @@ The global results:
 
 | Statistic | Value |
 |-----------|-------|
-| Median | -0.53¢ |
-| Std (IQR-based, robust) | 4.02¢ |
+| Median | -0.66¢ |
+| Std (IQR-based, robust) | 4.12¢ |
 
-The negative median confirms that bids typically sit below model fair value — that's the spread. The standard deviation of 4.02¢ captures the noise around that baseline.
+The negative median confirms that bids typically sit below model fair value — that's the spread. The standard deviation of 4.12¢ captures the noise around that baseline.
 
 How often does the market actually overprice in our favor?
 
 | Overpricing Threshold | Frequency |
 |-----------------------|-----------|
-| bid > model | 43.8% |
-| bid > model + 2¢ | 25.7% |
-| bid > model + 4¢ | 15.2% |
-| bid > model + 6¢ | 8.5% |
-| bid > model + 8¢ | 4.6% |
+| bid > model | 42.3% |
+| bid > model + 2¢ | 25.2% |
+| bid > model + 4¢ | 15.1% |
+| bid > model + 6¢ | 8.7% |
+| bid > model + 8¢ | 4.9% |
 
 About 15% of the time, the market bids 4¢+ above our model's fair value. That's the optionality we're capturing.
 
@@ -149,11 +149,11 @@ But the global average obscures something important: **noise is not constant acr
 
 | Model Probability | Noise σ | Ratio vs ATM |
 |-------------------|---------|-------------|
-| 10% (decided game) | 2.6¢ | 0.39x |
-| 30% | 5.7¢ | 0.85x |
+| 10% (decided game) | 2.8¢ | 0.41x |
+| 30% | 5.8¢ | 0.85x |
 | 50% (contested) | 6.7¢ | 1.00x |
-| 70% | 5.7¢ | 0.85x |
-| 90% (decided game) | 2.7¢ | 0.40x |
+| 70% | 5.8¢ | 0.86x |
+| 90% (decided game) | 2.8¢ | 0.41x |
 
 Market noise varies by over 5x depending on how contested the game is, and the shape is no accident — it follows p(1-p), the gamma of a binary option. In close games (peak gamma), there's genuine disagreement between participants about the outcome, and the bid bounces around substantially. In decided games (near-zero gamma), everyone agrees on the price, and the bid barely moves. The convexity of the payoff determines how much noise there is to harvest.
 
@@ -187,30 +187,30 @@ sell_premium = σ(p) × φ(d) + (μ_sell - continuation) × Φ(d)
 
 Where σ(p) is the probability-conditioned market noise at the current state, and μ_sell is the expected sell proceeds net of fees. This is the exact same mathematics as a European call — the expected value of max(bid - continuation, 0) under a normal distribution.
 
-Critically, the backward induction uses the conditional noise measured earlier — σ(p) rather than a single global σ. At each node, the sell premium is computed using the noise level appropriate for that probability. A node at p = 0.50 sees σ = 6.7¢ and gets substantial sell premium. A node at p = 0.90 sees σ = 2.7¢ and gets much less. This means the BI naturally produces lower option values for positions in decided games and higher values for contested ones — the asymmetry emerges from the physics rather than being imposed after the fact. And the equilibrium it finds is the same no-free-lunch constraint that underlies Black-Scholes: at every node, the theta you burn (option value decaying each timestep) is exactly offset by the gamma you expect to harvest from market noise, adjusted for the fee savings of holding to settlement.
+Critically, the backward induction uses the conditional noise measured earlier — σ(p) rather than a single global σ. At each node, the sell premium is computed using the noise level appropriate for that probability. A node at p = 0.50 sees σ = 6.7¢ and gets substantial sell premium. A node at p = 0.90 sees σ = 2.8¢ and gets much less. This means the BI naturally produces lower option values for positions in decided games and higher values for contested ones — the asymmetry emerges from the physics rather than being imposed after the fact. And the equilibrium it finds is the same no-free-lunch constraint that underlies Black-Scholes: at every node, the theta you burn (option value decaying each timestep) is exactly offset by the gamma you expect to harvest from market noise, adjusted for the fee savings of holding to settlement.
 
 But there's a subtlety. Backward induction treats every timestep as an independent sell opportunity. In reality, market noise is autocorrelated — a mispricing at time *t* is partially correlated with the mispricing at *t + 30 seconds*. If you use 30-second steps, you'd be counting correlated opportunities as independent, inflating the option value.
 
-To calibrate the right timestep, I measured the autocorrelation structure of bid-model residuals across 930,000+ snapshots:
+To calibrate the right timestep, I measured the autocorrelation structure of bid-model residuals across 970 games:
 
 | Lag | Autocorrelation |
 |-----|-----------------|
-| 15s | 0.54 |
+| 15s | 0.53 |
 | 30s | 0.46 |
-| 60s | 0.40 |
-| 120s | 0.29 |
+| 60s | 0.39 |
+| 120s | 0.30 |
 | 300s | 0.19 |
 
-At 120-second intervals, autocorrelation drops to 0.29 — roughly 8% shared variance between consecutive steps, which is low enough to treat as approximately independent. A 40-minute game at DT=120 gives 20 approximately independent sell opportunities.
+At 120-second intervals, autocorrelation drops to 0.30 — roughly 9% shared variance between consecutive steps, which is low enough to treat as approximately independent. A 40-minute game at DT=120 gives 20 approximately independent sell opportunities.
 
 Running backward induction at this calibrated timestep produces an option value surface across every combination of score differential, time remaining, and pregame probability. But deploying a 3D lookup table in production introduces file dependencies, grid discretization artifacts, and interpolation edge cases.
 
 ### The Closed-Form Formula
 
-Instead, I fit a three-parameter closed-form formula to the backward induction output — 34,000+ grid points — achieving an RMSE of 0.34¢:
+Instead, I fit a three-parameter closed-form formula to the backward induction output — 34,000+ grid points — achieving an RMSE of 0.31¢:
 
 ```
-OV = 0.39 × N^0.42 × (1 + 16.12 × p(1-p))
+OV = 0.34 × N^0.43 × (1 + 18.36 × p(1-p))
 ```
 
 Where:
@@ -219,11 +219,11 @@ Where:
 
 This is analogous to the relationship between the binomial tree and Black-Scholes. The binomial tree (backward induction) solves the problem exactly on a discrete grid. Black-Scholes (the formula) captures the same economics in closed form — no grid, no file, no lookup. And just as Black-Scholes decomposes into Greeks, so does this formula:
 
-**N^0.42 — Theta.** Option value bleeds away as the game clock runs down. Each tick of time that passes is one fewer independent sell opportunity. Doubling your remaining time doesn't double your option value, because you only need *one* good exit. The 0.42 exponent emerges naturally from the diminishing marginal value of additional independent draws from a noise distribution.
+**N^0.43 — Theta.** Option value bleeds away as the game clock runs down. Each tick of time that passes is one fewer independent sell opportunity. Doubling your remaining time doesn't double your option value, because you only need *one* good exit. The 0.43 exponent emerges naturally from the diminishing marginal value of additional independent draws from a noise distribution.
 
-**0.39** — The base scale factor per sell opportunity, reflecting the expected positive part of the noise distribution discounted by the negative mean bias (bids typically sit below fair value) and the cost of exercising.
+**0.34** — The base scale factor per sell opportunity, reflecting the expected positive part of the noise distribution discounted by the negative mean bias (bids typically sit below fair value) and the cost of exercising.
 
-**(1 + 16.12 × p(1-p)) — Gamma.** This is the dominant term. p(1-p) is the gamma of a binary option: it peaks at p = 0.50 and drops to zero at the extremes, exactly mirroring the empirical σ(p) curve. In a contested game, gamma is high, market noise is large, and sell opportunities are abundant. In a decided game, gamma is near zero, the market barely moves, and there's little optionality to capture. At p = 0.50, this multiplier reaches its maximum of 5.03×; at p = 0.90, it drops to 2.45×.
+**(1 + 18.36 × p(1-p)) — Gamma.** This is the dominant term. p(1-p) is the gamma of a binary option: it peaks at p = 0.50 and drops to zero at the extremes, exactly mirroring the empirical σ(p) curve. In a contested game, gamma is high, market noise is large, and sell opportunities are abundant. In a decided game, gamma is near zero, the market barely moves, and there's little optionality to capture. At p = 0.50, this multiplier reaches its maximum of 5.59×; at p = 0.90, it drops to 2.65×.
 
 The formula is re-calibrated periodically as more market data accumulates — measuring fresh conditional noise parameters σ(p), running backward induction with probability-dependent noise at DT=120, and refitting the three coefficients.
 
@@ -267,7 +267,7 @@ Exit if: bid > model × 100 + option_value + fee
 **Example:** 20 minutes remaining, score tied, model says 60% win probability.
 
 ```
-Option value = 5.0¢ (from formula: 0.39 × 10^0.42 × 4.87)
+Option value = 5.0¢ (from formula: 0.34 × 10^0.43 × 5.41)
 Exit threshold = 60 + 5.0 + 1.7 = 66.7¢
 ```
 
@@ -285,13 +285,13 @@ The fix is a **microstate haircut** — an additive premium on EV_hold that rais
 
 The pattern is clear: excess dispersion spikes inside 2 minutes in tied or one-point games, reaching nearly 15¢ — three times the global noise level. By |margin| ≥ 5, the effect vanishes entirely regardless of time. A residual signal remains measurable in the 4–6 minute range for close games, but diminishes rapidly beyond that. This is pure microstate: possession matters enormously when the game is tied with a minute left, and barely at all otherwise.
 
-A separable exponential fits the surface with 0.79¢ RMSE:
+A separable exponential fits the surface with 0.84¢ RMSE:
 
 ```
-H_raw(t, |m|) = 26.94 × exp(-t / 119) × exp(-|m| / 1.5)
+H_raw(t, |m|) = 26.24 × exp(-t / 128) × exp(-|m| / 1.4)
 ```
 
-The time decay constant τ = 119 seconds means the effect halves roughly every 80 seconds — consistent with the intuition that possession information is consumed within a few trips down the court. The margin decay of 1.5 points means that by a 3-point lead, possession matters roughly 85% less.
+The time decay constant τ = 128 seconds means the effect halves roughly every 89 seconds — consistent with the intuition that possession information is consumed within a few trips down the court. The margin decay of 1.4 points means that by a 3-point lead, possession matters roughly 88% less.
 
 In production, the raw surface is gated to prevent it from distorting midgame behavior. A linear ramp activates the haircut below 4:00 remaining, reaching full strength at 2:00, and a margin gate zeroes it for |margin| > 5. A conservative scale factor of k = 0.75 provides a buffer against overfitting:
 
@@ -368,16 +368,16 @@ The convergence ratio — how often the market moves toward the model versus the
 
 | Edge Threshold | ~5-10s | ~12-20s | ~25-40s | ~60-90s | n |
 |----------------|--------|---------|---------|---------|---|
-| 5%+ | 2.9:1 | 2.1:1 | 1.7:1 | 1.4:1 | 275,623 |
-| 10%+ | 2.4:1 | 1.8:1 | 1.6:1 | 1.3:1 | 66,263 |
-| 15%+ | 2.6:1 | 1.9:1 | 1.7:1 | 1.3:1 | 15,746 |
-| 20%+ | 3.6:1 | 2.5:1 | 2.0:1 | 1.3:1 | 5,699 |
+| 5%+ | 5.4:1 | 2.6:1 | 1.9:1 | 1.5:1 | 287,249 |
+| 10%+ | 4.2:1 | 2.3:1 | 1.8:1 | 1.4:1 | 65,966 |
+| 15%+ | 3.8:1 | 2.3:1 | 1.9:1 | 1.7:1 | 12,408 |
+| 20%+ | 4.7:1 | 2.5:1 | 1.8:1 | 1.5:1 | 2,148 |
 
-Two patterns emerge. First, the ratio increases with edge size at every lookahead window — at 20%+ disagreement, the market converges toward the model over 3.5x more often than the reverse within 5-10 seconds. Second, the ratio decays as the lookahead window extends, which is expected: the model's informational advantage gets priced in over time as the market absorbs the same signal.
+Two patterns emerge. First, the ratio increases with edge size at every lookahead window — at 20%+ disagreement, the market converges toward the model nearly 5x more often than the reverse within 5-10 seconds. Second, the ratio decays as the lookahead window extends, which is expected: the model's informational advantage gets priced in over time as the market absorbs the same signal.
 
-Critically, the ratio remains above 1.0 at every threshold and every window. Even at 60-90 seconds, all edge buckets still show convergence ratios of 1.3:1 or higher. This is the signature of genuine predictive alpha — noise or stale data would produce ratios at or below 1.0, particularly at longer horizons.
+Critically, the ratio remains above 1.0 at every threshold and every window. Even at 60-90 seconds, all edge buckets still show convergence ratios of 1.4:1 or higher. This is the signature of genuine predictive alpha — noise or stale data would produce ratios at or below 1.0, particularly at longer horizons.
 
-*From 286 games, ~276,000 edge observations. Continuously monitored as data grows.*
+*From 970 games, ~287,000 edge observations. Continuously monitored as data grows.*
 
 ---
 
@@ -406,7 +406,7 @@ Or at settlement:
   Receive 100¢ if win, 0¢ if lose (free, no fees)
 ```
 
-**Option value** is computed via closed-form formula calibrated to backward induction using probability-conditioned market noise — σ(p) ranges from 2.6¢ in decided games to 6.7¢ in contested ones. **Microstate haircut** adds an informational-disadvantage premium in the final minutes of close games, calibrated from excess residual dispersion and gated to activate only below 4:00 remaining at |margin| ≤ 5. Both are periodically re-fit as snapshot data grows.
+**Option value** is computed via closed-form formula calibrated to backward induction using probability-conditioned market noise — σ(p) ranges from 2.8¢ in decided games to 6.7¢ in contested ones. **Microstate haircut** adds an informational-disadvantage premium in the final minutes of close games, calibrated from excess residual dispersion and gated to activate only below 4:00 remaining at |margin| ≤ 5. Both are periodically re-fit as snapshot data grows.
 
 The system runs autonomously. A cron job at 4 AM processes completed games and regenerates predictions. The live trader fires up before tip-off, subscribes to WebSocket feeds, and makes rational EV-maximizing decisions every second until the last game settles.
 

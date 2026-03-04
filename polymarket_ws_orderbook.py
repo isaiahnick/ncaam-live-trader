@@ -127,7 +127,7 @@ class PolymarketWSOrderbook:
         self._connected = False
         self.last_any_message_ts = 0.0
         self._reconnect_delay = 1.0
-        self._max_reconnect_delay = 30.0
+        self._max_reconnect_delay = 2.0
     
     def start(self):
         """Start background thread with WebSocket connection"""
@@ -147,6 +147,7 @@ class PolymarketWSOrderbook:
     def stop(self):
         """Stop WebSocket and background thread"""
         self._running = False
+        self._connected = False
         if self._loop:
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread:
@@ -169,6 +170,27 @@ class PolymarketWSOrderbook:
         if self._loop and self._connected:
             self._loop.call_soon_threadsafe(
                 lambda: asyncio.ensure_future(self._send_subscriptions())
+            )
+    
+    def resubscribe_all(self):
+        """Force re-subscription of all tracked slugs. 
+        Fixes silent data loss where connection is alive but updates stop."""
+        with self._lock:
+            if not self._subscribed_slugs:
+                return
+            self._pending_subscriptions.update(self._subscribed_slugs)
+        
+        if self._loop and self._connected:
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._send_subscriptions())
+            )
+    
+    def force_reconnect(self):
+        """Kill connection to trigger clean auto-reconnect with fresh subscriptions."""
+        if self._ws and self._loop:
+            print(f"  🔄 [POLY-WS] Force reconnecting...")
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._ws.close())
             )
     
     def unsubscribe(self, slugs: List[str]):
@@ -261,14 +283,15 @@ class PolymarketWSOrderbook:
             try:
                 await self._connect_and_run()
             except Exception as e:
-                if self.verbose:
-                    print(f"[POLY-WS] Connection error: {e}")
+                print(f"  ⚠️ [POLY-WS] Connection lost: {e}")
                 self._connected = False
             
             if self._running:
-                if self.verbose:
-                    print(f"[POLY-WS] Reconnecting in {self._reconnect_delay}s...")
-                await asyncio.sleep(self._reconnect_delay)
+                print(f"  🔄 [POLY-WS] Reconnecting in {self._reconnect_delay:.0f}s...")
+                try:
+                    await asyncio.sleep(self._reconnect_delay)
+                except (RuntimeError, asyncio.CancelledError):
+                    break  # Loop stopped by stop()
                 self._reconnect_delay = min(
                     self._reconnect_delay * 2,
                     self._max_reconnect_delay
@@ -290,26 +313,29 @@ class PolymarketWSOrderbook:
         async with websockets.connect(
             self.WS_URL,
             additional_headers=headers,
-            ping_interval=20,
-            ping_timeout=10
+            ping_interval=10,
+            ping_timeout=5
         ) as ws:
             self._ws = ws
             self._connected = True
             self._reconnect_delay = 1.0  # Reset on successful connect
             
-            if self.verbose:
-                print("[POLY-WS] Connected!")
+            print(f"  ✓ [POLY-WS] Connected ({len(self._subscribed_slugs)} subs to restore)")
             
             # Re-subscribe everything (reconnect scenario)
             with self._lock:
                 self._pending_subscriptions.update(self._subscribed_slugs)
             await self._send_subscriptions()
             
-            # Process messages
-            async for message in ws:
-                if not self._running:
-                    break
-                self._handle_message(message)
+            try:
+                # Process messages
+                async for message in ws:
+                    if not self._running:
+                        break
+                    self._handle_message(message)
+            finally:
+                self._connected = False
+                self._ws = None
     
     async def _send_subscriptions(self):
         """Send subscription requests for pending slugs"""
